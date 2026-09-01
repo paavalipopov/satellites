@@ -1,0 +1,128 @@
+# Core LaTeX auxiliary files
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fmt
+*.fot
+*.cb
+*.cb2
+*.xdv
+*.fdb_latexmk
+
+# Bibliography and citation files (BibTeX / Biber)
+*.bbl
+*.bcf
+*.blg
+*-blx.aux
+*-blx.bib
+*.run.xml
+
+# Index and glossary files
+*.idx
+*.ilg
+*.ind
+*.ist
+*.glg
+*.glo
+*.gls
+*.glsdefs
+*.acn
+*.acr
+*.alg
+
+# SyncTeX (for jumping between editor and PDF)
+*.synctex
+*.synctex(busy)
+*.synctex.gz
+*.synctex.gz(busy)
+*.pdfsync
+
+# Compiled output documents
+# (Comment these out if you actually want to commit your final PDFs)
+*.pdf
+*.dvi
+*.ps
+
+# Package-specific files
+# minted (syntax highlighting)
+_minted-*/
+*.pyg
+
+# tikz (externalized figures)
+*-figure*.dpth
+*-figure*.md5
+*-figure*.pdf
+
+# hyperref
+*.brf
+
+# todonotes
+*.tdo
+
+# Beamer presentation files
+*.nav
+*.snm
+*.vrb
+
+# OS and Editor specific (Optional but recommended)
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+*.sublime-workspace
+
+archives/
+imaging_data/
+RNAseq
+docs/01_on_data/data
+docs/02_on_MDD_data/data
+
+# Editors / IDEs
+.vscode/
+.idea/
+.history/
+*.code-workspace
+
+# Local environment files
+.env
+.env.*
+.python-version
+
+# Logs / temp files
+*.log
+*.out
+*.tmp
+*.bak
+
+# macOS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.nox/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
