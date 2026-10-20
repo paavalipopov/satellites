@@ -4,7 +4,7 @@ Stages run top to bottom; each card lists what the stage does (left) and
 what it generates (right).  Thumbnails come from a real sample and all
 numbers from SimConfig, so the figure tracks the code.
 
-    python scripts/make_pipeline_figure.py      # -> figures/hsi_pipeline.{pdf,svg,png}
+    python make_pipeline_figure.py      # -> hsi_pipeline.{pdf,svg,png} next to this file
 """
 import os
 import sys
@@ -18,7 +18,8 @@ from matplotlib.collections import PatchCollection
 from matplotlib.colors import to_rgb
 from matplotlib.patches import Circle, FancyBboxPatch, Rectangle
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))   # project root: src/, assets/
 sys.path.insert(0, ROOT)
 from src import SimConfig, SpectralLibrary          # noqa: E402
 from src.pipeline import generate_sample            # noqa: E402
@@ -328,7 +329,7 @@ def main():
          "mask  =  label", (LANE_R + 12, (ym + yo) / 2), 270)
 
     ok = check_overflow(ax)
-    out = os.path.join(ROOT, "figures", "hsi_pipeline")
+    out = os.path.join(HERE, "hsi_pipeline")
     for ext in ("pdf", "svg", "png"):
         fig.savefig(f"{out}.{ext}", dpi=300 if ext == "png" else None, facecolor="white")
     print("wrote", out + ".{pdf,svg,png}", "| layout ok" if ok else "| LAYOUT OVERFLOW",

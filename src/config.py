@@ -127,7 +127,7 @@ class SimConfig:
     legacy_patch_label_bug: bool = False   # original discarded its own unique patch labels
 
     # ---------------- paths ----------------
-    material_dir: str = "data/material_refined"
+    material_dir: str = "assets/materials"     # relative to root; originals in original_files/
 
     # ------------------------------------------------------------------
     @property
