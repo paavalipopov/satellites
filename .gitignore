@@ -77,12 +77,6 @@ Thumbs.db
 .idea/
 *.sublime-workspace
 
-archives/
-imaging_data/
-RNAseq
-docs/01_on_data/data
-docs/02_on_MDD_data/data
-
 # Editors / IDEs
 .vscode/
 .idea/
@@ -126,3 +120,6 @@ dist/
 .venv/
 venv/
 ENV/
+
+Claude outputs/
+assets/

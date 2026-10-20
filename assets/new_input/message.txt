@@ -1,0 +1,2 @@
+Here is an example of a recovered object. It is a mag+6 (toy) satellite with a mag+13.6 unresolved companion (which you will never see). The satellite only occupies a small region near the center of the image. There are 10 wavelength slices, ordered from red to blue. The wavelengths (in nm) are:
+914.286, 800.000, 711.111,   640.000, 581.818, 533.333, 492.308, 457.143, 426.667, 400.000. I used several different materials spectra in this model.
