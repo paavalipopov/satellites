@@ -1,4 +1,5 @@
-"""Stage 0 — the measured spectral library.
+"""
+Measured spectral library.
 
 Three spreadsheets hold directed-hemispheric reflectance (DHR) for 46 spacecraft
 materials, each with a pristine and (usually) an electron-irradiated trace.
@@ -7,6 +8,7 @@ the pristine/irradiated pair per material.
 
 The blend between the two states happens later, per scene, in `pipeline`.
 """
+
 from __future__ import annotations
 
 import os
@@ -21,6 +23,11 @@ from .config import SimConfig
 # ----------------------------------------------------------------------
 # Material index <-> name.  Index 0 is background; 1..46 are materials.
 # Grouped by which part of the spacecraft they may be assigned to.
+# TODO for later: think about how to organize the materials without variables, 
+# by just organizing the material data into something more readable and getting the 
+# names from there. Something like csv/json files? It should be compatible with the 
+# config params like require_irradiated that does not mix the material indices.
+
 BUS = [
     "LCP", "Thermalbright_N", "Melinex", "Mylar", "CORIN_XLS", "Kapton-MT",
     "Kapton-HN", "Solar_cell", "Black paint", "Kapton_CRC", "Kapton_CS)",
@@ -48,22 +55,9 @@ N_CLASSES = len(MATERIAL_NAMES) + 1                    # 47, including backgroun
 _SHEET_FILES = {"bus": "Bus.xlsx", "wings": "Wings.xlsx", "antenna": "antenna.xlsx"}
 
 _TOL = 1e-6          # ignore float dust around the [0, 1] boundary
-# Within this of [0, 1] is a measurement offset, not junk.  DHR below 0 is
-# impossible — reflected flux is non-negative energy — but DHR slightly ABOVE 1
-# is physically reachable and common, for three reasons:
-#   1. photoluminescence.  With the monochromator before the sample, a material
-#      that absorbs short and re-emits long adds signal at the emission
-#      wavelength.  ZnO/potassium-silicate white paints (AZ-93, AZW-LAII) do
-#      luminesce near their band edge, so a few percent there is credible.
-#   2. reference-standard normalisation.  DHR is measured against a working
-#      standard (Spectralon ~0.98-0.99); if its certified value is not divided
-#      out, everything is inflated by 1-2%.
-#   3. sphere substitution error, ~1%, when the sample is more specular than
-#      the standard.
-# So <= ~1.05 is measurement; above ~1.1 is not recoverable as reflectance
-# unless a known fluorophore explains it.
-_MARGINAL = 0.05
+_MARGINAL = 0.05     # ignore the detector artifacts above 1 + _MARGINAL
 _EDGE_BANDS = 3      # a band this close to either end of the grid counts as "edge"
+# TODO what the _EDGE_BANDS is used for in logic? also, I cropped description for _MARGINAL, yet I want understand how it relates to clipping to [0, 1], if it does
 
 
 class SpectralLibraryWarning(UserWarning):
@@ -73,20 +67,6 @@ class SpectralLibraryWarning(UserWarning):
 # Duplicate / near-duplicate pairs measured at 19-49% mutual confusion.
 # Kept as a note rather than acted on: several of the 47 "classes" are the
 # same physical material, which makes the label set partly ill-posed.
-# Two sheets carry values that cannot be reflectance for the material named.
-# Gold reflects ~0.97 in the NIR; `Gold_foil` reads 0.002-0.006 across the whole
-# range with no gold-like rise at 500-600 nm.  Copper reflects ~0.97 above
-# 700 nm; `Copper_foil` peaks at 0.25.  The separate `Copper` sheet
-# (0.26/0.65/0.74/0.81/0.84 at 450/600/800/1500/2400 nm) has the right shape and
-# magnitude, so the instrument was capable of measuring it.  These two are
-# suspected unit or column errors, not physics.  Note the consequence: a
-# spuriously dark Gold_foil collides with the genuinely dark solar cells, which
-# is very likely why Gold_foil <-> Ge solar cell confuse at 34%.
-SUSPECT_SHEETS = {
-    "Gold_foil":   "reads 0.002-0.006; bulk gold is ~0.97 in the NIR",
-    "Copper_foil": "peaks at 0.25; bulk copper is ~0.97 above 700 nm",
-}
-
 KNOWN_DUPLICATES = [
     ("GFRP", "Glass_Fiber"), ("Aluminum", "Aluminum 6061"),
     ("Gold_foil", "Ge solar cell"), ("CFRP", "Black paint"),
@@ -94,6 +74,16 @@ KNOWN_DUPLICATES = [
     ("Kapton_CRC", "Kapton-HN"),
 ]
 
+# Two sheets carry values that are suspicious for the material named.
+# Gold reflects ~0.97 in the NIR; `Gold_foil` reads 0.002-0.006 across the whole
+# range with no gold-like rise at 500-600 nm.  Copper reflects ~0.97 above
+# 700 nm; `Copper_foil` peaks at 0.25.  The separate `Copper` sheet
+# (0.26/0.65/0.74/0.81/0.84 at 450/600/800/1500/2400 nm) has the right shape and
+# magnitude, so the instrument was capable of measuring it.
+SUSPECT_SHEETS = {
+    "Gold_foil":   "reads 0.002-0.006; bulk gold is ~0.97 in the NIR",
+    "Copper_foil": "peaks at 0.25; bulk copper is ~0.97 above 700 nm",
+}
 
 @dataclass
 class Material:
