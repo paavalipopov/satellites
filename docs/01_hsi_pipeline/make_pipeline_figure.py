@@ -21,8 +21,7 @@ from matplotlib.patches import Circle, FancyBboxPatch, Rectangle
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))   # project root: src/, assets/
 sys.path.insert(0, ROOT)
-from src import SimConfig, SpectralLibrary          # noqa: E402
-from src.pipeline import generate_sample            # noqa: E402
+from src.data_generation import SimConfig, SpectralLibrary, generate_sample   # noqa: E402
 
 SEED = 3                     # layout 2: panels, bus, boom, dish
 

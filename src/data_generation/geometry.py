@@ -10,6 +10,7 @@ A panel seen edge-on and a panel seen face-on produce identical values.
 """
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from .config import SimConfig
@@ -132,22 +133,18 @@ def rasterize(components, cfg: SimConfig, angles_deg, image_size: int | None = N
         z = V[:, 2]
         for tri in faces:
             if cfg.rasterizer == "cv2":
-                _fill_cv2(mask, zbuf, uv[tri], z[tri], int(mat_id), cfg)
+                _fill_cv2(mask, zbuf, uv[tri], z[tri], int(mat_id))
             else:
-                _fill(mask, zbuf, uv[tri], z[tri], int(mat_id), cfg)
+                _fill(mask, zbuf, uv[tri], z[tri], int(mat_id))
     return mask
 
 
-def _fill_cv2(mask, zbuf, uv, z, mat_id, cfg: SimConfig):
+def _fill_cv2(mask, zbuf, uv, z, mat_id):
     """The original's coverage rule: truncate vertices to int32 and let
     `cv2.fillConvexPoly` decide.  Kept because it is the only reason the
     0.01-thick solar panels ever appeared.  Depth is one value per face."""
-    import cv2
     n = mask.shape[0]
     pts = uv.astype(np.int32)
-    if cfg.legacy_drop_edge_faces:
-        if pts[:, 0].min() < 0 or pts[:, 0].max() >= n or pts[:, 1].min() < 0 or pts[:, 1].max() >= n:
-            return
     poly = np.zeros((n, n), np.uint8)
     cv2.fillConvexPoly(poly, pts, 1)
     depth = float(np.mean(z))
@@ -157,14 +154,9 @@ def _fill_cv2(mask, zbuf, uv, z, mat_id, cfg: SimConfig):
         mask[upd] = mat_id
 
 
-def _fill(mask, zbuf, uv, z, mat_id, cfg: SimConfig):
+def _fill(mask, zbuf, uv, z, mat_id):
+    """Exact pixel-centre coverage, with perspective-correct depth."""
     n = mask.shape[0]
-    if cfg.legacy_drop_edge_faces:
-        # Original behaviour: any face whose projection touches the frame edge
-        # was skipped entirely rather than clipped, silently dropping geometry.
-        if uv[:, 0].min() < 0 or uv[:, 0].max() >= n or uv[:, 1].min() < 0 or uv[:, 1].max() >= n:
-            return
-
     x0 = max(int(np.floor(uv[:, 0].min())), 0)
     x1 = min(int(np.ceil(uv[:, 0].max())) + 1, n)
     y0 = max(int(np.floor(uv[:, 1].min())), 0)
@@ -186,15 +178,10 @@ def _fill(mask, zbuf, uv, z, mat_id, cfg: SimConfig):
     if not inside.any():
         return
 
-    if cfg.legacy_flat_face_depth:
-        # Original behaviour: one depth for the whole triangle, which mis-orders
-        # large or oblique faces.
-        depth = np.full(inside.shape, float(np.mean(z)))
-    else:
-        # Perspective-correct: 1/z is linear in screen space.
-        inv = w0 / z[0] + w1 / z[1] + w2 / z[2]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            depth = np.where(inv > 0, 1.0 / inv, np.inf)
+    # perspective-correct: 1/z is linear in screen space
+    inv = w0 / z[0] + w1 / z[1] + w2 / z[2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        depth = np.where(inv > 0, 1.0 / inv, np.inf)
 
     sub = zbuf[y0:y1, x0:x1]
     upd = inside & (depth < sub)

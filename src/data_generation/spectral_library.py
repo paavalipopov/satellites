@@ -55,14 +55,14 @@ N_CLASSES = len(MATERIAL_NAMES) + 1                    # 47, including backgroun
 _SHEET_FILES = {"bus": "Bus.xlsx", "wings": "Wings.xlsx", "antenna": "antenna.xlsx"}
 
 _TOL = 1e-6          # ignore float dust around the [0, 1] boundary
-_MARGINAL = 0.05     # ignore the detector artifacts above 1 + _MARGINAL
-_EDGE_BANDS = 3      # a band this close to either end of the grid counts as "edge"
-# TODO what the _EDGE_BANDS is used for in logic? also, I cropped description for _MARGINAL, yet I want understand how it relates to clipping to [0, 1], if it does
+_MARGINAL = 0.05     # warning text only: outside [-0.05, 1.05] counts as "severe"
+_EDGE_BANDS = 3      # warning text only: within 3 bands of a grid end counts as "edge"
+_GAP_NM = 10.0       # unmeasured bands closer than this to a measurement are not reported # TODO 'not reported' sounds vague. does it raise warnings? what can silently happen with this gap?
 
 
 class SpectralLibraryWarning(UserWarning):
-    """Raised as a warning when the measured library contains values that are
-    not physically possible reflectances on the requested wavelength grid."""
+    """Warns about library values that are not physical reflectances, or about
+    grid bands that no measurement covers."""
 
 # Duplicate / near-duplicate pairs measured at 19-49% mutual confusion.
 # Kept as a note rather than acted on: several of the 47 "classes" are the
@@ -97,13 +97,24 @@ class Material:
 
 
 @dataclass
-class InvalidBand:
+class InvalidBand: # TODO: this class and UnmeasuredBand below make me confused, I don't understand their role in the script. if they are mostly used for reporting, can you add notes to it, or just explain in a docstring what they do? be brief, this file is already long enough. can we trim them without looksing functionality/clarity?
     """One band of one spectrum that falls outside physical reflectance."""
     material: str
     state: str                      # "pristine" | "irradiated"
     band: int
     wavelength_nm: float
     value: float
+
+
+@dataclass
+class UnmeasuredBand:
+    """One grid band outside a spectrum's measured wavelength range."""
+    material: str
+    state: str                      # "pristine" | "irradiated"
+    band: int
+    wavelength_nm: float
+    side: str                       # "blue" (below the scan) | "red" (above it)
+    edge_nm: float                  # nearest measured wavelength
 
 
 class SpectralLibrary:
@@ -114,8 +125,9 @@ class SpectralLibrary:
         self.grid = cfg.wavelengths_nm
         self.materials: dict[str, Material] = {}
         self.invalid: list[InvalidBand] = []
+        self.unmeasured: list[UnmeasuredBand] = []
         self._load(os.path.join(root, cfg.material_dir))
-        self._report_invalid()
+        self._report()
 
     # ------------------------------------------------------------------
     def _load(self, path: str) -> None:
@@ -124,7 +136,7 @@ class SpectralLibrary:
             for name, df in sheets.items():
                 if name not in NAME_TO_ID:
                     continue                       # ignore sheets not in the taxonomy
-                pris, irr = self._resample(df)
+                pris, irr, ranges = self._resample(df)
                 if pris is None:
                     continue
                 for state, v in (("pristine", pris), ("irradiated", irr)):
@@ -135,6 +147,7 @@ class SpectralLibrary:
                         InvalidBand(name, state, int(b), float(self.grid[b]), float(v[b]))
                         for b in bad
                     ]
+                    self.unmeasured += self._unmeasured(name, state, *ranges[state])
                 self.materials[name] = Material(
                     name=name, id=NAME_TO_ID[name], group=group,
                     pristine=self._apply_policy(pris),
@@ -152,25 +165,37 @@ class SpectralLibrary:
         d = df.iloc[:, :3].apply(pd.to_numeric, errors="coerce")
         d = d.dropna(subset=[d.columns[0], d.columns[1]])
         if d.empty:
-            return None, None
+            return None, None, None
         lam = d.iloc[:, 0].to_numpy(float)
         order = np.argsort(lam)
         lam = lam[order]
 
-        def interp(y: np.ndarray) -> np.ndarray:
+        def interp(x: np.ndarray, y: np.ndarray) -> np.ndarray:
             """Resample only — the invalid-value policy is applied later, so
             that validation sees what the spreadsheet actually says."""
             right = 0.0 if self.cfg.extrapolate_red == "zero" else y[-1]
-            return np.interp(self.grid, lam, y, left=y[0], right=right)
+            return np.interp(self.grid, x, y, left=y[0], right=right)
 
-        pris = interp(d.iloc[:, 1].to_numpy(float)[order])
+        pris = interp(lam, d.iloc[:, 1].to_numpy(float)[order])
+        ranges = {"pristine": (lam[0], lam[-1])}
         irr = None
         if d.shape[1] >= 3:
             raw = d.iloc[:, 2].to_numpy(float)[order]
             ok = np.isfinite(raw)
             if ok.sum() >= 2:
-                irr = interp(np.interp(lam, lam[ok], raw[ok]))
-        return pris, irr
+                irr = interp(lam[ok], raw[ok])
+                ranges["irradiated"] = (lam[ok][0], lam[ok][-1])
+        return pris, irr, ranges
+
+    def _unmeasured(self, name: str, state: str, lo: float, hi: float) -> list[UnmeasuredBand]: # TODO what's the role of UnmeasuredBand in the SpectralLib? are they shown during report?
+        """Grid bands more than _GAP_NM outside the measured range [lo, hi]."""
+        out = []
+        for b, lam in enumerate(self.grid):
+            if lam < lo - _GAP_NM:
+                out.append(UnmeasuredBand(name, state, b, float(lam), "blue", float(lo)))
+            elif lam > hi + _GAP_NM:
+                out.append(UnmeasuredBand(name, state, b, float(lam), "red", float(hi)))
+        return out
 
     # ------------------------------------------------------------------
     def _apply_policy(self, v):
@@ -178,14 +203,16 @@ class SpectralLibrary:
             return None
         return np.clip(v, 0.0, 1.0) if self.cfg.clip_reflectance else v
 
-    def _report_invalid(self) -> None:
-        """Always detect; `cfg.on_invalid` decides whether to speak up."""
-        if not self.invalid or self.cfg.on_invalid == "ignore":
-            return
-        msg = self.invalid_summary()
-        if self.cfg.on_invalid == "raise":
-            raise ValueError(msg)
-        warnings.warn(msg, SpectralLibraryWarning, stacklevel=3)
+    def _report(self) -> None:
+        """Always detect; `on_invalid` and `on_unmeasured` decide whether to speak up."""
+        checks = ((self.invalid, self.cfg.on_invalid, self.invalid_summary),
+                  (self.unmeasured, self.cfg.on_unmeasured, self.unmeasured_summary))
+        for found, policy, summary in checks:
+            if not found or policy == "ignore":
+                continue
+            if policy == "raise":
+                raise ValueError(summary())
+            warnings.warn(summary(), SpectralLibraryWarning, stacklevel=3)
 
     def invalid_summary(self) -> str:
         """Human-readable account of every non-physical value on this grid."""
@@ -238,6 +265,29 @@ class SpectralLibrary:
             lines.append("  clip_reflectance=False: these enter the cubes unaltered.")
         return "\n".join(lines)
 
+    def unmeasured_summary(self) -> str:
+        """Human-readable account of grid bands that no measurement covers."""
+        if not self.unmeasured:
+            return "every grid band is covered by its spectrum's measurements"
+        by_trace: dict[tuple[str, str, str], list[UnmeasuredBand]] = {}
+        for ub in self.unmeasured:
+            by_trace.setdefault((ub.material, ub.state, ub.side), []).append(ub)
+        lines = [
+            f"{len(self.unmeasured)} grid bands across {len(by_trace)} spectra lie more than "
+            f"{_GAP_NM:.0f} nm outside the measured range, on the {self.cfg.n_bands}-band "
+            f"{self.cfg.lambda_min_nm:.0f}-{self.cfg.lambda_max_nm:.0f} nm grid.",
+        ]
+        red_fill = "set to 0" if self.cfg.extrapolate_red == "zero" else "held at the last value"
+        for (mat, state, side), items in sorted(by_trace.items()):
+            edge = items[0].edge_nm
+            far = max(abs(ub.wavelength_nm - edge) for ub in items)
+            where, fill = ("below", "held at the first value") if side == "blue" else ("above", red_fill)
+            lines.append(f"  {mat:20s} {state:11s} {len(items)} band(s) {where} {edge:.0f} nm "
+                         f"(up to {far:.0f} nm away), {fill}")
+        lines.append("  These values are extrapolated, not measured: trim the grid or drop "
+                     "the material if they matter.")
+        return "\n".join(lines)
+
     def blend(self, name: str, weight: float) -> np.ndarray:
         """Stage 0 output: one spectrum, somewhere between pristine and irradiated.
 
@@ -274,20 +324,3 @@ class SpectralLibrary:
 
     def ids_of(self, group: str) -> list[int]:
         return [NAME_TO_ID[n] for n in self.groups[group]]
-
-    def out_of_range_report(self) -> list[tuple[str, str, float, float, int]]:
-        """Which spectra leave [0, 1] on this grid, and where.
-
-        With `clip_reflectance=False` this lists the detector artifacts the
-        original fed straight into training — roughly 20 of 92 traces, almost
-        all at band 0, spanning -9.8 to +15.6.
-        """
-        rows = []
-        for m in self.materials.values():
-            for state, v in (("pristine", m.pristine_raw), ("irradiated", m.irradiated_raw)):
-                if v is None:
-                    continue
-                if v.min() < -0.01 or v.max() > 1.05:
-                    worst = int(np.argmax(np.abs(v - np.clip(v, 0, 1))))
-                    rows.append((m.name, state, float(v.min()), float(v.max()), worst))
-        return sorted(rows, key=lambda r: -max(abs(r[2]), r[3]))

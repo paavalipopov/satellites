@@ -39,11 +39,11 @@ class SimConfig:
     #     s_noisy = s + N(0, (material_noise_scale * std(s))^2)
     material_noise_scale: float = 0.5
 
-    # (b) diffraction PSF.  sigma_px(lambda) = (psf_k * lambda / D) / plate_scale
-    aperture_m: float = 3.6 #TODO briefly explain how these vars relate to difraction PSF, do they affect the formula above, or are they used in psf_sigma_px?
-    psf_k: float = 0.25
-    pixel_pitch_m: float = 5e-6
-    focal_length_m: float = 120.0
+    # (b) diffraction PSF (see `psf_sigma_px`): sigma_px = (psf_k * lambda / D) / (p / f)
+    aperture_m: float = 3.6          # D, telescope aperture; sets the scale lambda/D
+    psf_k: float = 0.25              # Gaussian sigma in units of lambda/D (Airy fit ~0.42)
+    pixel_pitch_m: float = 5e-6      # p, detector pixel size
+    focal_length_m: float = 120.0    # f; p/f is the angle one pixel covers
 
     # (c) additive per-pixel sensor noise, applied AFTER the blur
     sensor_noise_std: float = 0.02
@@ -69,12 +69,12 @@ class SimConfig:
     # across the scene, that inconsistency is visible within a single sample.
     # Material ids are NOT renumbered, so a 47-class checkpoint still runs —
     # the excluded classes simply never appear.
-    require_irradiated: bool = False # TODO I removed betacloth mention from the excluded list, make sure the code ignores it too, and briefly explain to me what was the problem with this material
+    require_irradiated: bool = False
 
-    # On unmeasured spectra, the original behaviour past the last measured wavelength 
-    # was `right=0.0`, which makes a material identifiable by where its measurements stop.
-    # extrapolate_red controls what happens to the red end of the measured spectrum.
-    extrapolate_red: str = "hold"          # "hold" | "zero" # TODO it seems to me that in addition to this handling we need to raise a warning like with on_invalid, maybe call it on_unmeasured_spectra
+    # Bands past a sheet's measured range: the blue end repeats the first value, the red
+    # end follows extrapolate_red ("zero" sets to 0, "hold" keeps the last value). # TODO: this explanation needs a bit of rework. I don't understand from it what happens on the blue end, is it 'hold' by default, like with red? 
+    extrapolate_red: str = "hold"          # "hold" | "zero"
+    on_unmeasured: str = "warn"            # "warn" | "raise" | "ignore"; gaps > 10 nm
 
     # ---------------- geometry and POV ----------------
     # READ THIS BEFORE TRUSTING THE SATELLITE MASKS.
@@ -87,11 +87,11 @@ class SimConfig:
     #     connectors    (0.3 thick)  ~0.23 px across
     #     solar panels  (4 x 2)  ~3.1 x 1.5 px each, separated by ~9 px
     # The bus, antenna and connectors are sub-pixel and appear in the original's masks 
-    # ONLY because `rasterizer="cv2"` fill degenerate slivers generously. 
+    # ONLY because `rasterizer="cv2"` fills degenerate slivers generously. 
     # 
-    # See `SimConfig.resolved()` below if you want to avoid rasterization.
+    # See `SimConfig.resolved()` below for a properly sampled render (60 px, exact rasterizer).
 
-    panel_thickness: float = 0.01 # TODO briefly explain what this var controls and where 0.01 comes from
+    panel_thickness: float = 0.01          # solar-panel thickness, scene units (original's)
     rasterizer: str = "cv2"                # "cv2" (as original) | "exact"
 
     # ---------------- scene mixture ----------------
@@ -99,20 +99,6 @@ class SimConfig:
     p_satellite: float = 0.30
     p_shapes: float = 0.30
     p_patches: float = 0.40
-
-    # ---------------- faithfulness switches ----------------
-    # Each reproduces a defect in the original.  All default to False.
-    # Measured: at the configuration actually used (image_size=15,
-    # camera_height=17) this rule NEVER fires — 0.0% of triangles touch the
-    # frame edge, because the object always sits ~81% of the way across a
-    # centred frame.  So the original's training masks were NOT chopped; this
-    # is latent dead code.  It starts to bite only if the camera comes closer:
-    # 1.6% of faces dropped at camera_height=12, 20.5% at 9, 70% at 5.
-    # TODO let's remove these switches and the code that uses them, should make things simpler and easier to read
-    legacy_drop_edge_faces: bool = False   # original skipped faces touching the frame edge
-    legacy_flat_face_depth: bool = False   # original used one z per triangle
-    legacy_triangle_bug: bool = False      # original's "triangle" had 2 points -> a line
-    legacy_patch_label_bug: bool = False   # original discarded its own unique patch labels
 
     # ---------------- paths ----------------
     material_dir: str = "assets/materials"     # relative to root; originals in original_files/
@@ -127,10 +113,9 @@ class SimConfig:
     def psf_sigma_px(self) -> np.ndarray:
         """Per-band Gaussian PSF width, in pixels.
 
-        theta = psf_k * lambda / D            (diffraction angle, radians)
-        plate_scale = pixel_pitch / focal     (radians per pixel)
-        sigma_px = theta / plate_scale
-        # TODO I think the vars used here introeuced above, remind their meaning here too (psf_k, aperture...)
+        theta = psf_k * lambda / D       blur angle in radians, D = aperture_m
+        plate_scale = p / f              angle per pixel, p = pixel_pitch_m, f = focal_length_m
+        sigma_px = theta / plate_scale   psf_k = Gaussian sigma in units of lambda/D
         """
         theta = self.psf_k * (self.wavelengths_nm * 1e-9) / self.aperture_m
         plate_scale = self.pixel_pitch_m / self.focal_length_m
@@ -148,34 +133,12 @@ class SimConfig:
         return hashlib.sha256(blob).hexdigest()[:12]
 
     # ------------------------------------------------------------------
-    # TODO question about these methoids: they are resetting default config if I runt them, right? the default is defined above.
-    # I think we can remove first two after all the other changes.
-    @classmethod
-    def june_2026(cls, **kw) -> "SimConfig":
-        """The configuration the June 2026 SRR checkpoints were trained on."""
-        return cls(lambda_max_nm=2000.0, sensor_noise_std=0.2, **kw)
-
-    @classmethod
-    def legacy(cls, **kw) -> "SimConfig":
-        """Bug-for-bug faithful to the original `moduler_gen.py`."""
-        return cls(
-            clip_reflectance=False,
-            on_invalid="ignore",
-            extrapolate_red="zero",
-            legacy_drop_edge_faces=True,
-            legacy_flat_face_depth=True,
-            legacy_triangle_bug=True,
-            legacy_patch_label_bug=True,
-            **kw,
-        )
-
     @classmethod
     def resolved(cls, image_size: int = 60, **kw) -> "SimConfig":
         """Same scene, properly sampled.  At image_size=60 the object spans
-        ~49 px, the bus is ~2.4 px across, and the exact rasteriser agrees with
-        the cv2 one.  Material accuracy measured higher here (0.89 vs 0.81),
-        but the trained models never saw objects this large — it is
-        extrapolation, not their training regime."""
+        ~49 px and the bus is ~2.4 px across.  Material accuracy measured
+        higher here (0.89 vs 0.81), but the trained models never saw objects
+        this large — it is extrapolation, not their training regime."""
         return cls(image_size=image_size, rasterizer="exact", **kw)
 
     def with_(self, **kw) -> "SimConfig":
