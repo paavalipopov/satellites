@@ -11,6 +11,7 @@ The blend between the two states happens later, per scene, in `pipeline`.
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -55,9 +56,8 @@ N_CLASSES = len(MATERIAL_NAMES) + 1                    # 47, including backgroun
 _SHEET_FILES = {"bus": "Bus.xlsx", "wings": "Wings.xlsx", "antenna": "antenna.xlsx"}
 
 _TOL = 1e-6          # ignore float dust around the [0, 1] boundary
-_MARGINAL = 0.05     # warning text only: outside [-0.05, 1.05] counts as "severe"
-_EDGE_BANDS = 3      # warning text only: within 3 bands of a grid end counts as "edge"
-_GAP_NM = 10.0       # unmeasured bands closer than this to a measurement are not reported # TODO 'not reported' sounds vague. does it raise warnings? what can silently happen with this gap?
+_MARGINAL = 0.05     # invalid values beyond [-0.05, 1.05] count as "severe"
+_GAP_NM = 10.0       # held values this close to a scan's end are not flagged; zero fills always are
 
 
 class SpectralLibraryWarning(UserWarning):
@@ -94,27 +94,23 @@ class Material:
     irradiated: np.ndarray | None   # [n_bands] or None
     pristine_raw: np.ndarray = None       # before clipping — what the sheet says
     irradiated_raw: np.ndarray = None
+    measured: dict = None           # state -> (wavelength_nm, values) as read from the sheet
 
 
 @dataclass
-class InvalidBand: # TODO: this class and UnmeasuredBand below make me confused, I don't understand their role in the script. if they are mostly used for reporting, can you add notes to it, or just explain in a docstring what they do? be brief, this file is already long enough. can we trim them without looksing functionality/clarity?
-    """One band of one spectrum that falls outside physical reflectance."""
+class FlaggedBand:
+    """One grid band of one spectrum flagged while loading.  Collected in
+    `lib.flags`; the warnings and `plot_materials` are built from these."""
     material: str
     state: str                      # "pristine" | "irradiated"
     band: int
     wavelength_nm: float
-    value: float
+    issue: str                      # "invalid": outside [0, 1] | "unmeasured": filled past the scan
+    value: float                    # invalid: the value; unmeasured: nm past the scan (- blue, + red)
 
-
-@dataclass
-class UnmeasuredBand:
-    """One grid band outside a spectrum's measured wavelength range."""
-    material: str
-    state: str                      # "pristine" | "irradiated"
-    band: int
-    wavelength_nm: float
-    side: str                       # "blue" (below the scan) | "red" (above it)
-    edge_nm: float                  # nearest measured wavelength
+    @property
+    def severe(self) -> bool:
+        return self.issue == "invalid" and not -_MARGINAL <= self.value <= 1.0 + _MARGINAL
 
 
 class SpectralLibrary:
@@ -124,8 +120,7 @@ class SpectralLibrary:
         self.cfg = cfg
         self.grid = cfg.wavelengths_nm
         self.materials: dict[str, Material] = {}
-        self.invalid: list[InvalidBand] = []
-        self.unmeasured: list[UnmeasuredBand] = []
+        self.flags: list[FlaggedBand] = []
         self._load(os.path.join(root, cfg.material_dir))
         self._report()
 
@@ -136,156 +131,162 @@ class SpectralLibrary:
             for name, df in sheets.items():
                 if name not in NAME_TO_ID:
                     continue                       # ignore sheets not in the taxonomy
-                pris, irr, ranges = self._resample(df)
-                if pris is None:
+                measured = self._read(df)
+                if measured is None:
                     continue
-                for state, v in (("pristine", pris), ("irradiated", irr)):
-                    if v is None:
-                        continue
-                    bad = np.where((v < -_TOL) | (v > 1.0 + _TOL))[0]
-                    self.invalid += [
-                        InvalidBand(name, state, int(b), float(self.grid[b]), float(v[b]))
-                        for b in bad
-                    ]
-                    self.unmeasured += self._unmeasured(name, state, *ranges[state])
+
+                raw = {state: self._resample(lam, y) for state, (lam, y) in measured.items()}
+                for state, v in raw.items():
+                    self.flags += self._flag(name, state, v, measured[state][0])
+
                 self.materials[name] = Material(
                     name=name, id=NAME_TO_ID[name], group=group,
-                    pristine=self._apply_policy(pris),
-                    irradiated=self._apply_policy(irr),
-                    pristine_raw=pris, irradiated_raw=irr,
+                    pristine=self._apply_policy(raw["pristine"]),
+                    irradiated=self._apply_policy(raw.get("irradiated")),
+                    pristine_raw=raw["pristine"], irradiated_raw=raw.get("irradiated"),
+                    measured=measured,
                 )
         missing = set(NAME_TO_ID) - set(self.materials)
         if missing:
             raise RuntimeError(f"materials missing from the spreadsheets: {sorted(missing)}")
 
-    def _resample(self, df: pd.DataFrame):
-        """Columns are (wavelength_nm, pristine, irradiated).  Columns 3+ hold
-        no numeric data — they are blank spacers plus a text note giving the
-        irradiation dose."""
+    @staticmethod
+    def _read(df: pd.DataFrame) -> dict | None:
+        """state -> (wavelength_nm, values), sorted by wavelength.  Columns are
+        (wavelength_nm, pristine, irradiated); columns 3+ hold no numeric data,
+        only blank spacers and a text note giving the irradiation dose."""
         d = df.iloc[:, :3].apply(pd.to_numeric, errors="coerce")
         d = d.dropna(subset=[d.columns[0], d.columns[1]])
         if d.empty:
-            return None, None, None
+            return None
+
         lam = d.iloc[:, 0].to_numpy(float)
         order = np.argsort(lam)
         lam = lam[order]
-
-        def interp(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-            """Resample only — the invalid-value policy is applied later, so
-            that validation sees what the spreadsheet actually says."""
-            right = 0.0 if self.cfg.extrapolate_red == "zero" else y[-1]
-            return np.interp(self.grid, x, y, left=y[0], right=right)
-
-        pris = interp(lam, d.iloc[:, 1].to_numpy(float)[order])
-        ranges = {"pristine": (lam[0], lam[-1])}
-        irr = None
+        out = {"pristine": (lam, d.iloc[:, 1].to_numpy(float)[order])}
         if d.shape[1] >= 3:
-            raw = d.iloc[:, 2].to_numpy(float)[order]
-            ok = np.isfinite(raw)
+            irr = d.iloc[:, 2].to_numpy(float)[order]
+            ok = np.isfinite(irr)
             if ok.sum() >= 2:
-                irr = interp(lam[ok], raw[ok])
-                ranges["irradiated"] = (lam[ok][0], lam[ok][-1])
-        return pris, irr, ranges
-
-    def _unmeasured(self, name: str, state: str, lo: float, hi: float) -> list[UnmeasuredBand]: # TODO what's the role of UnmeasuredBand in the SpectralLib? are they shown during report?
-        """Grid bands more than _GAP_NM outside the measured range [lo, hi]."""
-        out = []
-        for b, lam in enumerate(self.grid):
-            if lam < lo - _GAP_NM:
-                out.append(UnmeasuredBand(name, state, b, float(lam), "blue", float(lo)))
-            elif lam > hi + _GAP_NM:
-                out.append(UnmeasuredBand(name, state, b, float(lam), "red", float(hi)))
+                out["irradiated"] = (lam[ok], irr[ok])
         return out
 
-    # ------------------------------------------------------------------
+    def _resample(self, lam: np.ndarray, y: np.ndarray, grid: np.ndarray | None = None) -> np.ndarray:
+        """Interpolate onto the grid: the blue end holds the first value, the red end
+        follows `extrapolate_red`.  No clipping here, so validation sees the sheet."""
+        right = 0.0 if self.cfg.extrapolate_red == "zero" else y[-1]
+        return np.interp(self.grid if grid is None else grid, lam, y, left=y[0], right=right)
+
+    def _flag(self, name: str, state: str, v: np.ndarray, lam: np.ndarray) -> list[FlaggedBand]:
+        """Bands outside [0, 1], and bands filled past the scan (see _GAP_NM)."""
+        out = [FlaggedBand(name, state, int(b), float(self.grid[b]), "invalid", float(v[b]))
+               for b in np.where((v < -_TOL) | (v > 1.0 + _TOL))[0]]
+
+        red_tol = 0.0 if self.cfg.extrapolate_red == "zero" else _GAP_NM
+        for b, g in enumerate(self.grid):
+            past = g - lam[0] if g < lam[0] else g - lam[-1] if g > lam[-1] else 0.0
+            if past < -_GAP_NM or past > red_tol:
+                out.append(FlaggedBand(name, state, b, float(g), "unmeasured", float(past)))
+        return out
+
     def _apply_policy(self, v):
         if v is None:
             return None
         return np.clip(v, 0.0, 1.0) if self.cfg.clip_reflectance else v
 
+    # ------------------------------------------------------------------ reporting
     def _report(self) -> None:
         """Always detect; `on_invalid` and `on_unmeasured` decide whether to speak up."""
-        checks = ((self.invalid, self.cfg.on_invalid, self.invalid_summary),
-                  (self.unmeasured, self.cfg.on_unmeasured, self.unmeasured_summary))
-        for found, policy, summary in checks:
-            if not found or policy == "ignore":
+        checks = (("invalid", self.cfg.on_invalid, self.invalid_summary),
+                  ("unmeasured", self.cfg.on_unmeasured, self.unmeasured_summary))
+        for issue, policy, summary in checks:
+            if policy == "ignore" or not any(f.issue == issue for f in self.flags):
                 continue
             if policy == "raise":
                 raise ValueError(summary())
             warnings.warn(summary(), SpectralLibraryWarning, stacklevel=3)
 
+    @property
+    def _grid_desc(self) -> str:
+        return f"{self.cfg.n_bands}-band {self.grid[0]:.0f}-{self.grid[-1]:.0f} nm grid"
+
     def invalid_summary(self) -> str:
-        """Human-readable account of every non-physical value on this grid."""
-        if not self.invalid:
+        """Values outside [0, 1], worst spectra first, and what to do about them."""
+        inv = [f for f in self.flags if f.issue == "invalid"]
+        if not inv:
             return "all spectra lie within [0, 1] on this grid"
-        by_mat: dict[tuple[str, str], list[InvalidBand]] = {}
-        for ib in self.invalid:
-            by_mat.setdefault((ib.material, ib.state), []).append(ib)
-        bands = sorted({ib.band for ib in self.invalid})
-        lines = [
-            f"{len(self.invalid)} non-physical reflectance values across "
-            f"{len(by_mat)} spectra, on the {self.cfg.n_bands}-band "
-            f"{self.cfg.lambda_min_nm:.0f}-{self.cfg.lambda_max_nm:.0f} nm grid.",
-            f"  affected bands: {bands}  "
-            f"(lambda {[round(float(self.grid[b]), 1) for b in bands]} nm)",
-        ]
-        n_edge = sum(1 for ib in self.invalid
-                     if ib.band < _EDGE_BANDS or ib.band >= self.cfg.n_bands - _EDGE_BANDS)
-        n_severe = sum(1 for ib in self.invalid
-                       if ib.value < -_MARGINAL or ib.value > 1.0 + _MARGINAL)
-        lines.append(f"  {n_severe} severe (outside [{-_MARGINAL:.2f}, {1+_MARGINAL:.2f}]), "
-                     f"{len(self.invalid) - n_severe} marginal; "
-                     f"{n_edge} at a grid edge, {len(self.invalid) - n_edge} in the interior.")
-        worst = sorted(by_mat.items(),
-                       key=lambda kv: -max(abs(x.value) for x in kv[1]))
+        by_trace: dict[tuple[str, str], list[FlaggedBand]] = {}
+        for f in inv:
+            by_trace.setdefault((f.material, f.state), []).append(f)
+        n_sev = sum(f.severe for f in inv)
+
+        lines = [f"{len(inv)} values outside [0, 1] in {len(by_trace)} spectra on the {self._grid_desc}: "
+                 f"{n_sev} severe (beyond [{-_MARGINAL:.2f}, {1 + _MARGINAL:.2f}]), "
+                 f"{len(inv) - n_sev} marginal."]
+        worst = sorted(by_trace.items(), key=lambda kv: -max(abs(f.value) for f in kv[1]))
         for (mat, state), items in worst[:10]:
-            ex = max(items, key=lambda x: abs(x.value))
-            lines.append(f"  {mat:20s} {state:11s} {len(items)} band(s), worst "
-                         f"{ex.value:+8.2f} at band {ex.band} "
-                         f"({ex.wavelength_nm:.1f} nm)")
+            ex = max(items, key=lambda f: abs(f.value))
+            lines.append(f"  {mat:20s} {state:11s} {len(items)} band(s), worst {ex.value:+7.2f} "
+                         f"at {ex.wavelength_nm:.0f} nm")
         if len(worst) > 10:
             lines.append(f"  ... and {len(worst) - 10} more spectra")
-        if n_severe:
-            lines.append(
-                "  Severe values at a scan edge are instrument artifacts: DHR is a "
-                "ratio, and near the UV cutoff both signal and reference approach "
-                "zero, so the quotient is noise. These carry no information — "
-                "trim the grid past them rather than clipping.")
-        if len(self.invalid) - n_severe:
-            lines.append(
-                "  Marginal values (just outside [0, 1], often mid-band) are usually "
-                "a calibration offset against the reference standard, not junk — "
-                "clipping them is reasonable.")
-        if self.cfg.clip_reflectance:
-            lines.append(
-                "  clip_reflectance=True: all of the above were clipped to [0, 1], "
-                "which substitutes a fabricated value wherever the measurement was "
-                "actually missing.")
-        else:
-            lines.append("  clip_reflectance=False: these enter the cubes unaltered.")
+
+        lines += ["", "Severe values are scan-edge artifacts (DHR is a ratio of two near-zero "
+                      "signals there); marginal ones are calibration offsets."]
+        if n_sev:
+            lines.append(f"To drop the severe ones, trim the grid: {self._clean_range()}.")
+        lines.append("clip_reflectance=True clips all of them to [0, 1]: fine for marginal values, "
+                     "a made-up value for severe ones." if self.cfg.clip_reflectance
+                     else "clip_reflectance=False: they enter the cubes unaltered.")
+        lines.append('lib.plot_materials("invalid") shows them.')
         return "\n".join(lines)
 
+    def _clean_range(self) -> str:
+        """Smallest trim of the grid ends (5 nm steps, same n_bands) that leaves no severe value."""
+        n, lo, hi = self.cfg.n_bands, self.cfg.lambda_min_nm, self.cfg.lambda_max_nm
+        cap = 0.25 * (hi - lo)                          # trim at most a quarter per end
+
+        def severe(points):
+            return any(((v < -_MARGINAL) | (v > 1.0 + _MARGINAL)).any()
+                       for m in self.materials.values() for lam, y in m.measured.values()
+                       for v in [self._resample(lam, y, points)])
+
+        new_lo, new_hi = lo, hi
+        while new_lo - lo < cap and severe(np.linspace(new_lo, hi, n)[: n // 2]):
+            new_lo += 5.0
+        while hi - new_hi < cap and severe(np.linspace(new_lo, new_hi, n)[n // 2:]):
+            new_hi -= 5.0
+        if severe(np.linspace(new_lo, new_hi, n)):
+            return "not possible within a quarter of the range at either end"
+        trims = [f"lambda_min_nm={new_lo:g}"] * (new_lo != lo) + [f"lambda_max_nm={new_hi:g}"] * (new_hi != hi)
+        return ", ".join(trims)
+
     def unmeasured_summary(self) -> str:
-        """Human-readable account of grid bands that no measurement covers."""
-        if not self.unmeasured:
+        """Grid bands filled past a scan, per spectrum, and how to avoid them."""
+        un = [f for f in self.flags if f.issue == "unmeasured"]
+        if not un:
             return "every grid band is covered by its spectrum's measurements"
-        by_trace: dict[tuple[str, str, str], list[UnmeasuredBand]] = {}
-        for ub in self.unmeasured:
-            by_trace.setdefault((ub.material, ub.state, ub.side), []).append(ub)
-        lines = [
-            f"{len(self.unmeasured)} grid bands across {len(by_trace)} spectra lie more than "
-            f"{_GAP_NM:.0f} nm outside the measured range, on the {self.cfg.n_bands}-band "
-            f"{self.cfg.lambda_min_nm:.0f}-{self.cfg.lambda_max_nm:.0f} nm grid.",
-        ]
+        by_trace: dict[tuple[str, str, bool], list[FlaggedBand]] = {}
+        for f in un:
+            by_trace.setdefault((f.material, f.state, f.value < 0), []).append(f)
+
         red_fill = "set to 0" if self.cfg.extrapolate_red == "zero" else "held at the last value"
-        for (mat, state, side), items in sorted(by_trace.items()):
-            edge = items[0].edge_nm
-            far = max(abs(ub.wavelength_nm - edge) for ub in items)
-            where, fill = ("below", "held at the first value") if side == "blue" else ("above", red_fill)
-            lines.append(f"  {mat:20s} {state:11s} {len(items)} band(s) {where} {edge:.0f} nm "
-                         f"(up to {far:.0f} nm away), {fill}")
-        lines.append("  These values are extrapolated, not measured: trim the grid or drop "
-                     "the material if they matter.")
+        lines = [f"{len(un)} grid bands in {len(by_trace)} spectra lie past the measured scan "
+                 f"on the {self._grid_desc}:"]
+        starts, ends = [], []
+        for (mat, state, blue), items in sorted(by_trace.items()):
+            edge = items[0].wavelength_nm - items[0].value          # first or last measured nm
+            far = max(abs(f.value) for f in items)
+            (starts if blue else ends).append(edge)
+            lines.append(f"  {mat:20s} {state:11s} {len(items)} band(s) {'below' if blue else 'above'} "
+                         f"{edge:.0f} nm (up to {far:.0f} nm away), "
+                         f"{'held at the first value' if blue else red_fill}")
+
+        red_tol = 0.0 if self.cfg.extrapolate_red == "zero" else _GAP_NM
+        fix = ([f"lambda_min_nm >= {math.ceil(max(starts) - _GAP_NM)}"] if starts else []) + \
+              ([f"lambda_max_nm <= {math.floor(min(ends) + red_tol)}"] if ends else [])
+        lines += ["", f"These values are extrapolated, not measured; to avoid them use {' and '.join(fix)}.",
+                  'lib.plot_materials("unmeasured") shows them.']
         return "\n".join(lines)
 
     def blend(self, name: str, weight: float) -> np.ndarray:
@@ -324,3 +325,88 @@ class SpectralLibrary:
 
     def ids_of(self, group: str) -> list[int]:
         return [NAME_TO_ID[n] for n in self.groups[group]]
+
+    # ------------------------------------------------------------------ plotting
+    def plot_materials(self, which="flagged"):
+        """Measured scan (line) and grid values (dots) for each selected material,
+        flagged bands circled; one panel per material, about sqrt(n) per row.
+
+        `which`: a list of names, a group ("bus", "wings", "antenna"), "all", or a
+        flag kind ("flagged", "invalid", "severe", "marginal", "unmeasured").
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+
+        names = self._select(which)
+        if not names:
+            raise ValueError(f"no materials match {which!r}")
+        ncol = math.ceil(math.sqrt(len(names)))
+        nrow = math.ceil(len(names) / ncol)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 2.3 * nrow + 0.4), squeeze=False)
+        colour = {"pristine": "#2a78d6", "irradiated": "#eb6834", "invalid": "#d62728",
+                  "unmeasured": "#6b6b70"}
+        lo, hi, ylo, yhi = self.grid[0], self.grid[-1], -0.1, 1.2   # values beyond ylo/yhi sit on the edge
+
+        for ax, name in zip(axes.flat, names):
+            m = self.materials[name]
+            for state, (lam, y) in m.measured.items():
+                near = (lam > lo - 30) & (lam < hi + 30)
+                ax.plot(lam[near], np.clip(y[near], ylo, yhi), color=colour[state], lw=0.8, alpha=0.5)
+                ax.plot(self.grid, getattr(m, state), "o", color=colour[state], ms=2)
+
+            mine = [f for f in self.flags if f.material == name]
+            for f in mine:
+                y = f.value if f.issue == "invalid" else getattr(m, f.state)[f.band]
+                marker = "s" if f.issue == "unmeasured" else "^" if y > yhi else "v" if y < ylo else "o"
+                ax.plot(f.wavelength_nm, np.clip(y, ylo, yhi), marker, mfc="none",
+                        mec=colour[f.issue], ms=6, mew=1.1)
+
+            counts = {"severe": sum(f.severe for f in mine),
+                      "marginal": sum(f.issue == "invalid" and not f.severe for f in mine),
+                      "unmeasured": sum(f.issue == "unmeasured" for f in mine)}
+            label = " · ".join(f"{k} {v}" for k, v in counts.items() if v)
+            worst = max((f.value for f in mine if f.issue == "invalid"), key=abs, default=0.0)
+            if not ylo <= worst <= yhi:
+                label += f" · worst {worst:+.1f}"
+            ax.set_title(f"{name}\n{label}", fontsize=8, loc="left")
+            ax.axhspan(0, 1, color="0.95", zorder=0)
+            ax.set(xlim=(lo - 20, hi + 20), ylim=(ylo, yhi))
+            ax.tick_params(labelsize=7)
+
+        for ax in axes.flat[len(names):]:
+            ax.set_visible(False)
+        handles = [Line2D([], [], color=colour[s], marker="o", ms=3, lw=0.8, label=s)
+                   for s in ("pristine", "irradiated")]
+        handles += [Line2D([], [], ls="", marker=mk, mfc="none", mec=colour[k], ms=6, label=lab)
+                    for k, mk, lab in (("invalid", "o", "invalid"), ("invalid", "^", "invalid, off scale"),
+                                       ("unmeasured", "s", "unmeasured"))]
+        fig.legend(handles=handles, loc="upper right", ncol=5, fontsize=7, frameon=False)
+        fig.supxlabel("wavelength (nm)", fontsize=8)
+        fig.supylabel("reflectance", fontsize=8)
+        fig.tight_layout(rect=(0, 0, 1, 1 - 0.35 / fig.get_figheight()))
+        return fig
+
+    def _select(self, which) -> list[str]:
+        """Material names for `plot_materials`: library order, or a list's own order."""
+        if not isinstance(which, str):
+            names = list(which)
+            unknown = [n for n in names if n not in self.materials]
+            if unknown:
+                raise ValueError(f"unknown materials: {unknown}")
+            return names
+        if which == "all":
+            return list(MATERIAL_NAMES)
+        if which in GROUPS:
+            return list(GROUPS[which])
+        if which in self.materials:
+            return [which]
+
+        kinds = {"flagged": lambda f: True,
+                 "invalid": lambda f: f.issue == "invalid",
+                 "severe": lambda f: f.severe,
+                 "marginal": lambda f: f.issue == "invalid" and not f.severe,
+                 "unmeasured": lambda f: f.issue == "unmeasured"}
+        if which not in kinds:
+            raise ValueError(f"unknown selection {which!r}: use names, a group, 'all' or one of {list(kinds)}")
+        hit = {f.material for f in self.flags if kinds[which](f)}
+        return [n for n in MATERIAL_NAMES if n in hit]

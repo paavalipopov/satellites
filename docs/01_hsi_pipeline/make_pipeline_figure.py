@@ -232,7 +232,7 @@ def main():
     ])
 
     # clean examples only: skip spectra the validator flagged
-    flagged = {ib.material for ib in lib.invalid}
+    flagged = {f.material for f in lib.flags if f.issue == "invalid"}
     picks = [m for m in sorted(s.material_ids)
              if lib.materials[s.material_names[m]].irradiated is not None
              and s.material_names[m] not in flagged][:3]

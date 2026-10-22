@@ -59,7 +59,7 @@ class SimConfig:
     # Note: clipping FABRICATES a value (a hard 1.0, or 0.0) where there is no
     # valid measurement.  If the offending bands sit at the edge of your grid,
     # trimming the grid is more honest than clipping. 
-    # The warning names the affected bands so you can do that.
+    # The warning suggests how far to trim.
     clip_reflectance: bool = True
 
     # Use only materials that actually have a measured irradiated trace.
@@ -71,10 +71,10 @@ class SimConfig:
     # the excluded classes simply never appear.
     require_irradiated: bool = False
 
-    # Bands past a sheet's measured range: the blue end repeats the first value, the red
-    # end follows extrapolate_red ("zero" sets to 0, "hold" keeps the last value). # TODO: this explanation needs a bit of rework. I don't understand from it what happens on the blue end, is it 'hold' by default, like with red? 
-    extrapolate_red: str = "hold"          # "hold" | "zero"
-    on_unmeasured: str = "warn"            # "warn" | "raise" | "ignore"; gaps > 10 nm
+    # Grid bands outside a sheet's measured range are filled, not measured: the blue
+    # end always repeats the first value; the red end follows extrapolate_red.
+    extrapolate_red: str = "hold"          # "hold": repeat the last value | "zero": set to 0
+    on_unmeasured: str = "warn"            # "warn" | "raise" | "ignore"
 
     # ---------------- geometry and POV ----------------
     # READ THIS BEFORE TRUSTING THE SATELLITE MASKS.

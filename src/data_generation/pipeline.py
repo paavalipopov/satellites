@@ -264,11 +264,9 @@ def material_noise(spectrum: np.ndarray, cfg: SimConfig,
 def paint_cube(mask: np.ndarray, spectra: dict[int, np.ndarray], n_bands: int) -> np.ndarray:
     """Stage 2c — extrude the 2-D mask into a 3-D cube.
 
-    This is the step that surprises people: there is only ONE geometry render.
     Each pixel gets its material's whole spectrum copied along the wavelength
-    axis, so before blurring every band holds the *identical spatial pattern* —
-    only the constant value inside each region differs from band to band.
-    Background stays exactly zero.
+    axis, so before blurring every band has the same spatial pattern; only the
+    value inside each region changes from band to band.  Background stays 0.
     """
     h, w = mask.shape
     cube = np.zeros((n_bands, h, w), float)
