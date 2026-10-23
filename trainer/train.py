@@ -22,11 +22,12 @@ from scipy import stats
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
-from src.datasets.base import EpochBatchSampler, collate_volumes
+from src.datasets.base import SeededBatchSampler, collate_volumes
 from src.registry import build_dataset, build_model, resolve_params
 from src.utils import (
     ModelCheckpoint,
     SegmentationMeter,
+    atomic_open,
     clear_rundir,
     plot_curves,
     setup_distributed_port,
@@ -35,6 +36,7 @@ from src.utils import (
 )
 
 METRICS = {"loss", *SegmentationMeter.names}  # every loader metric; selection picks from these
+PRED_COLUMNS = ("index", "kind", "pred", "target")  # saved per test scene
 
 setup_distributed_port()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -102,14 +104,17 @@ class CustomRunner(dl.Runner):
         augmentations. Within one epoch the value does not change, so the per-loader call
         just rewinds the stream.
         """
-        return self.cfg.experiment.global_seed
+        return self.cfg.experiment.sampler_seed
 
     def on_experiment_start(self, runner):
         torch.backends.cudnn.benchmark = self.cfg.experiment.cudnn_benchmark
         super().on_experiment_start(runner)
-        # engine.prepare has sharded it; test runs once at the end, or also every epoch
+        # engine.prepare has sharded them; tests run once at the end, or also every epoch
         every_epoch = self.cfg.experiment.test_every_epoch
-        self.test_loader = self.loaders["test"] if every_epoch else self.loaders.pop("test")
+        self.test_loaders = {
+            key: self.loaders[key] if every_epoch else self.loaders.pop(key)
+            for key in [k for k in self.loaders if k.startswith("test")]
+        }
         if not self.cfg.runtime.resume_runner:
             return
 
@@ -124,9 +129,7 @@ class CustomRunner(dl.Runner):
     def get_loaders(self):
         experiment, runtime = self.cfg.experiment, self.cfg.runtime
         # fresh train scenes per epoch and run; valid and test fixed by their seeds
-        splits = {
-            key: self.dataset.split(key, run=runtime.run_idx) for key in ("train", "valid", "test")
-        }
+        splits = {key: self.dataset.split(key, run=runtime.run_idx) for key in self.dataset.loaders}
         self._split_sizes = {name: len(split) for name, split in splits.items()}
         print(
             f"[Run {runtime.run_idx}] "
@@ -155,8 +158,12 @@ class CustomRunner(dl.Runner):
             # Plain sampler with the same seed on every rank. accelerate's
             # engine.prepare() already shards the DataLoader, so pre-sharding here would
             # shard twice and drop ~(1 - 1/world_size) of the data each epoch.
+            # Only train is shuffled; valid and test keep their index order.
+            sampler = SeededBatchSampler(
+                subset, experiment.batch_size, experiment.sampler_seed, shuffle=key == "train"
+            )
             kwargs = {
-                "sampler": EpochBatchSampler(subset, experiment.batch_size),
+                "sampler": sampler,
                 "collate_fn": collate_volumes,
                 "pin_memory": True,
                 "num_workers": num_workers,
@@ -180,7 +187,7 @@ class CustomRunner(dl.Runner):
             "seed_train": data.seed_train,
             "seed_valid": data.seed_valid,
             "seed_test": data.seed_test,
-            "global_seed": self.cfg.experiment.global_seed,
+            "sampler_seed": self.cfg.experiment.sampler_seed,
             "model_init_seed": self._init_seed(),
         }
 
@@ -245,8 +252,8 @@ class CustomRunner(dl.Runner):
             "loss": metrics.AdditiveMetric(),
             "pixels": SegmentationMeter(self.n_classes, self.engine.device),
         }
-        # (index, predicted mask, target mask) per batch, saved for test only
-        self.test_preds = [] if self.loader_key == "test" else None
+        # (index, kind, predicted mask, target mask) per batch, saved for test only
+        self.test_preds = [] if self.loader_key.startswith("test") else None
 
     def on_loader_end(self, runner):
         # compute the loader's metrics
@@ -257,9 +264,10 @@ class CustomRunner(dl.Runner):
 
         # predicted masks, merged across ranks in on_experiment_end
         if self.test_preds is not None:
-            index, pred, target = (torch.cat(column).numpy() for column in zip(*self.test_preds))
-            path = os.path.join(self._moredir, f"test_preds_rank{self.engine.process_index}.npz")
-            np.savez_compressed(path, index=index, pred=pred, target=target)
+            columns = (torch.cat(column).numpy() for column in zip(*self.test_preds))
+            rank = self.engine.process_index
+            path = os.path.join(self._moredir, f"{self.loader_key}_preds_rank{rank}.npz")
+            np.savez_compressed(path, **dict(zip(PRED_COLUMNS, columns)))
         super().on_loader_end(runner)
 
     def on_epoch_end(self, runner):
@@ -268,40 +276,39 @@ class CustomRunner(dl.Runner):
         super().on_epoch_end(runner)
 
     def on_experiment_end(self, runner):
-        # load the main selection's best weights and run them on test
+        # load the main selection's best weights and run them on every test loader
         checkpoint, main = self.callbacks["checkpoint"], self.cfg.experiment.selection[0]
         best = checkpoint.best[main]
         self.engine.wait_for_everyone()  # the main process has finished writing them
         self.engine.unwrap_model(self.model).load_state_dict(load_checkpoint(checkpoint.path(main)))
 
-        # prepare for test
         # epoch_step stamps the test logs, so point it at the epoch these
         # weights come from, then put the true epoch count back for epochs_run
         epoch_buffer, self.epoch_step = self.epoch_step, best["epoch"]
-        self.loader_key, self.loader = "test", self.test_loader
 
-        # run test
-        self._run_event("on_loader_start")
-        self._run_loader()
-        self._run_event("on_loader_end")
+        # run the tests
+        for self.loader_key, self.loader in self.test_loaders.items():
+            self._run_event("on_loader_start")
+            self._run_loader()
+            self._run_event("on_loader_end")
+            best["metrics"][self.loader_key] = {
+                k: float(v) for k, v in sorted(self.loader_metrics.items())
+            }
 
         # save logs and restore things
         self.engine.wait_for_everyone()  # every rank has saved its test predictions
         self.epoch_step = epoch_buffer
-        best["metrics"]["test"] = {
-            k: float(v) for k, v in sorted(self.loader_metrics.items())
-        }
 
         # final logging and cleanup
         if self.engine.is_main_process:
-            # combine the ranks' test predictions into one file, one row per test scene
-            parts = [np.load(path) for path in
-                     sorted(glob.glob(os.path.join(self._moredir, "test_preds_rank*.npz")))]
-            preds = {key: np.concatenate([part[key] for part in parts])
-                     for key in ("index", "pred", "target")}
-            _, keep = np.unique(preds["index"], return_index=True)  # DDP pads with repeats
-            np.savez_compressed(os.path.join(self._logdir, "test_predictions.npz"),
-                                epoch=best["epoch"], **{k: v[keep] for k, v in preds.items()})
+            # combine the ranks' predictions into one file per test loader, one row per scene
+            for key in self.test_loaders:
+                parts = [np.load(path) for path in
+                         sorted(glob.glob(os.path.join(self._moredir, f"{key}_preds_rank*.npz")))]
+                preds = {col: np.concatenate([part[col] for part in parts]) for col in PRED_COLUMNS}
+                _, keep = np.unique(preds["index"], return_index=True)  # DDP pads with repeats
+                np.savez_compressed(os.path.join(self._logdir, f"{key}_predictions.npz"),
+                                    epoch=best["epoch"], **{k: v[keep] for k, v in preds.items()})
 
             # save run summary
             summary = {
@@ -311,7 +318,7 @@ class CustomRunner(dl.Runner):
                 "epochs_run": int(self.epoch_step),
                 "split_sizes": self._split_sizes,
                 "metrics": best["metrics"],
-                "bests": checkpoint.best,  # every selection; test scores only with test_every_epoch
+                "bests": checkpoint.best,  # every selection; tests' scores only with test_every_epoch
                 "seeds": self._seeds(),
                 "world_size": self.engine.num_processes,
                 "batch_size_per_rank": self.cfg.experiment.batch_size,
@@ -331,8 +338,8 @@ class CustomRunner(dl.Runner):
 
     def handle_batch(self, batch):
         # target: [B,H,W] masks; index: each scene's position in its split, which with
-        # the split's seed gives the scene's generator seed
-        sample, target, index = batch
+        # the split's seed gives the scene's generator seed; kind: its scene type code
+        sample, target, index, kind = batch
         if self.cfg.experiment.channels_last:
             sample = sample.contiguous(memory_format=torch.channels_last)
         autocast = torch.autocast(
@@ -358,7 +365,9 @@ class CustomRunner(dl.Runner):
             accuracy = (pred == target).float().mean()
             self.meters["pixels"].update(pred, target)
             if self.test_preds is not None:
-                self.test_preds.append((index.cpu(), pred.byte().cpu(), target.byte().cpu()))
+                self.test_preds.append(
+                    (index.cpu(), kind.cpu(), pred.byte().cpu(), target.byte().cpu())
+                )
 
         # batch_metrics feeds the tqdm bar; the loader values are saved in the meters
         self.batch_metrics.update({"loss": loss, "accuracy": accuracy})
@@ -430,7 +439,7 @@ def main(cfg: DictConfig):
         # a resumed run keeps the old schedule, splits and optimizer state
         for key in ("experiment.epochs", "experiment.batch_size", "data.params.n_train",
                     "data.params.seed_train", "data.params.seed_valid", "data.params.seed_test",
-                    "experiment.global_seed", "runtime.world_size"):
+                    "experiment.sampler_seed", "runtime.world_size"):
             was = OmegaConf.select(OmegaConf.load(config_path), key)
             if was is not None and was != OmegaConf.select(cfg, key):
                 raise ValueError(
@@ -440,7 +449,7 @@ def main(cfg: DictConfig):
                 )
 
     # pre-flight maintenance: save the config
-    with open(config_path, "w") as handle:
+    with atomic_open(config_path) as handle:
         yaml.safe_dump(
             OmegaConf.to_container(cfg, resolve=True), handle, indent=4, sort_keys=False
         )
@@ -483,7 +492,7 @@ def main(cfg: DictConfig):
         with open(best_path) as handle:
             best = json.load(handle)
 
-        valid, test = best["metrics"].get("valid", {}), best["metrics"].get("test", {})
+        evaluated = {k: v for k, v in best["metrics"].items() if k != "train"}  # valid, test*
         rows.append(
             {
                 "run": best["run_idx"],
@@ -491,10 +500,10 @@ def main(cfg: DictConfig):
                 "epochs_run": best["epochs_run"],
                 "best_epoch": best["best_epoch"],
                 **{f"best_epoch@{m}": b["epoch"] for m, b in best.get("bests", {}).items()},
-                **{f"valid_{key}": value for key, value in valid.items()},
-                **{f"test_{key}": value for key, value in test.items()},
-                **{f"test_{k}@{m}": v for m, b in best.get("bests", {}).items()
-                   for k, v in b["metrics"].get("test", {}).items()},
+                **{f"{loader}_{k}": v for loader, ms in evaluated.items() for k, v in ms.items()},
+                **{f"{loader}_{k}@{m}": v for m, b in best.get("bests", {}).items()
+                   for loader, ms in b["metrics"].items() if loader.startswith("test")
+                   for k, v in ms.items()},
                 **best["seeds"],
                 "world_size": best["world_size"],
                 "batch_size_per_rank": best["batch_size_per_rank"],
@@ -506,7 +515,7 @@ def main(cfg: DictConfig):
         print("[Runs] no finished run yet; no summary")
         return
     rows.sort(key=lambda row: row["run"])
-    with open(os.path.join(logdir, "runs.csv"), "w", newline="") as handle:
+    with atomic_open(os.path.join(logdir, "runs.csv")) as handle:
         writer = csv.DictWriter(handle, fieldnames=list({k: 0 for row in rows for k in row}))
         writer.writeheader()
         writer.writerows(rows)
@@ -532,7 +541,7 @@ def main(cfg: DictConfig):
         if key.startswith("test"):
             print(f"[Runs] {key}: {summary[key]['mean']:.4f} +/- {summary[key]['std']:.4f}")
 
-    with open(os.path.join(logdir, "summary.json"), "w") as handle:
+    with atomic_open(os.path.join(logdir, "summary.json")) as handle:
         json.dump(summary, handle, indent=4)
 
     # every run's curves in one figure

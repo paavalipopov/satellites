@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -83,6 +84,16 @@ def clear_rundir(rundir):
         print(f"[Log] moved {moved} file(s) from an earlier run into {backup}")
 
 
+@contextmanager
+def atomic_open(path):
+    """Write to a temporary file, then move it over ``path``, so jobs writing the same
+    file at once never leave it half-written."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", newline="") as handle:
+        yield handle
+    os.replace(tmp, path)
+
+
 class ModelCheckpoint(dl.ICheckpointCallback):
     """Best weights per selection metric, plus the full training state for resuming.
 
@@ -146,9 +157,12 @@ class SegmentationMeter:
     ``compute()`` and its name to ``names``: ``experiment.selection`` accepts it then.
     Class 0 is background. ``miou`` and ``macro_f1`` average over the classes present in
     the target or the prediction; ``fg_*`` treat every material as one foreground class.
+    The paper's Table 1 reports ``macro_precision`` (all classes, 0 for a class never
+    predicted, as sklearn's zero_division=0) and ``fg_binary_accuracy``.
     """
 
-    names = ("accuracy", "miou", "macro_f1", "fg_accuracy", "fg_f1")
+    names = ("accuracy", "miou", "macro_f1", "macro_precision", "fg_accuracy", "fg_f1",
+             "fg_binary_accuracy")
 
     def __init__(self, n_classes, device):
         self.n_classes, self.device = n_classes, device
@@ -163,7 +177,8 @@ class SegmentationMeter:
     def update(self, pred, target):
         """Count a batch of ``[B,H,W]`` predicted and target masks."""
         k = self.n_classes
-        # pair (t, p) -> flat index t * k + p, i.e. row t, column p after .view(k, k) # TODO still not clear how bincount computes the confusion; when the answer is correct, what gets added?
+        # each pixel adds 1 to its (target t, prediction p) cell: code t*k + p is that cell's
+        # position once the k*k counts are cut into rows of k; correct pixels land on the diagonal
         self.confusion += torch.bincount((target * k + pred).flatten(), minlength=k * k).view(k, k)
 
     def compute(self, reduce=None):
@@ -176,12 +191,15 @@ class SegmentationMeter:
         # foreground: is it a material at all, and which one
         fg_tp, fg_fp, fg_fn = confusion[1:, 1:].sum(), confusion[0, 1:].sum(), confusion[1:, 0].sum()
         fg_pixels = confusion[1:].sum().clamp_min(1)
+        total = confusion.sum().clamp_min(1)
         return {
-            "accuracy": float(tp.sum() / confusion.sum().clamp_min(1)),
+            "accuracy": float(tp.sum() / total),
             "miou": float((tp / (tp + fp + fn).clamp_min(1))[seen].mean()),
             "macro_f1": float((2 * tp / (2 * tp + fp + fn).clamp_min(1))[seen].mean()),
+            "macro_precision": float((tp / (tp + fp).clamp_min(1)).mean()),
             "fg_accuracy": float(tp[1:].sum() / fg_pixels),
             "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
+            "fg_binary_accuracy": float((fg_tp + confusion[0, 0]) / total),
         }
 
 
@@ -205,7 +223,7 @@ def run_info(summaries, cfg):
     ]
 
     # metrics at each run's best epoch, mean±sd over runs
-    for name in ("train", "valid", "test"):
+    for name in ("train", "valid", *[k for k in first["metrics"] if k.startswith("test")]):
         keys = sorted(first["metrics"].get(name, {}))
         values = {k: [s["metrics"][name][k] for s in summaries] for k in keys}
         if values:
@@ -213,7 +231,7 @@ def run_info(summaries, cfg):
                 f"{k} {np.mean(v):.3f}" + (f"±{np.std(v):.3f}" if len(v) > 1 else "")
                 for k, v in values.items()
             ))
-    lines.append("curves      train blue, valid orange, test green if logged; one line per run")
+    lines.append("curves      train blue, valid orange, tests after; one line per run")
     return "\n".join(textwrap.fill(line, 74, subsequent_indent=" " * 12) for line in lines)
 
 
@@ -233,23 +251,25 @@ def plot_curves(rundirs, cfg, path):
         alpha = 1 if len(rundirs) == 1 else 0.5
         summaries = []
         for i, rundir in enumerate(rundirs):
-            # per-epoch logs as {column: array}, and the run's summary
+            # the run's summary, and per-epoch logs as {column: array}
+            with open(os.path.join(rundir, "run_summary.json")) as handle:
+                summaries.append(json.load(handle))
+            best, metrics = summaries[-1]["best_epoch"], summaries[-1]["metrics"]
+            tests = [name for name in metrics if name.startswith("test")]
             logs = {}
-            for name in ("train", "valid", "test", "_epoch_"):
+            for name in ("train", "valid", *tests, "_epoch_"):
                 log_path = os.path.join(rundir, f"{name}.csv")
-                if not os.path.isfile(log_path):  # test.csv exists only with test_every_epoch
+                if not os.path.isfile(log_path):  # test*.csv exist only with test_every_epoch
                     continue
                 with open(log_path) as handle:
                     rows = list(csv.DictReader(handle))
                 logs[name] = {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
-            with open(os.path.join(rundir, "run_summary.json")) as handle:
-                summaries.append(json.load(handle))
-            best, test = summaries[-1]["best_epoch"], summaries[-1]["metrics"].get("test", {})
             hide = "_" if i else ""  # "_" labels stay out of the legend
+            colors = {name: f"C{j}" for j, name in enumerate(("train", "valid", *tests))}
 
             # lr; train vs valid: loss, miou (solid), accuracy (dashed)
             lr_ax.plot(logs["_epoch_"]["step"], logs["_epoch_"]["lr"], color="k", alpha=alpha)
-            for name, color in (("train", "C0"), ("valid", "C1"), ("test", "C2")):
+            for name, color in colors.items():
                 if name not in logs:
                     continue
                 log = logs[name]
@@ -259,12 +279,14 @@ def plot_curves(rundirs, cfg, path):
                 metric_ax.plot(log["step"], log["accuracy"], color=color, alpha=alpha, ls="--",
                                label=f"{hide}{name} accuracy")
 
-            # best epoch: dots on lr and valid loss, test scores
+            # best epoch: dots on lr and valid loss, each test's scores
             for ax, log, key in ((lr_ax, logs["_epoch_"], "lr"), (loss_ax, logs["valid"], "loss")):
                 ax.plot(best, np.interp(best, log["step"], log[key]), "o", mfc="w", mec="k", ms=5)
-            metric_ax.plot(best, test.get("miou", np.nan), "k*", ms=9, label=f"{hide}test miou")
-            metric_ax.plot(best, test.get("accuracy", np.nan), "kx", ms=7,
-                           label=f"{hide}test accuracy")
+            for name in tests:
+                metric_ax.plot(best, metrics[name].get("miou", np.nan), "*", color=colors[name],
+                               mec="k", ms=10, label=f"{hide}{name} miou")
+                metric_ax.plot(best, metrics[name].get("accuracy", np.nan), "x",
+                               color=colors[name], ms=8, label=f"{hide}{name} accuracy")
 
         lr_ax.set(title="learning rate (end of epoch)", xlabel="epoch")
         metric_ax.set(title="mIoU and accuracy", xlabel="epoch")
@@ -282,7 +304,8 @@ def plot_curves(rundirs, cfg, path):
 
         fig.suptitle(cfg["experiment"]["name"])
         fig.tight_layout()
-        fig.savefig(path, dpi=110)
+        fig.savefig(f"{path}.{os.getpid()}.tmp", dpi=110, format="png")
+        os.replace(f"{path}.{os.getpid()}.tmp", path)  # atomic: jobs may plot at once
         plt.close(fig)
     except Exception as error:  # noqa: BLE001
         print(f"[Plot] {path} skipped: {error}")

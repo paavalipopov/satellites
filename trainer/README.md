@@ -3,6 +3,7 @@
 Each scene is a [36, 15, 15] cube with a [15, 15] material mask (0 = background, 1-46 =
 materials), generated on the fly by `src/data_generation` (a copy of the project's `src/data_generation`).
 Training scenes are fresh every epoch; valid and test are fixed sets, chosen by their seeds.
+Two test sets by default (`data.params.tests`): `test` (the scene mix) and `test_satellite`.
 Catalyst runner, Hydra config, single- or multi-GPU on SLURM.
 
 ## Environment
@@ -73,7 +74,7 @@ Everything lands under `logs/<experiment.name>/`.
 
 | file | what |
 |---|---|
-| `runs.csv` | one row per finished run: split sizes, best epoch, valid and **test** metrics, seeds, wall time |
+| `runs.csv` | one row per finished run: split sizes, best epoch, valid and **test** metrics (`test_*`, `test_satellite_*`), seeds, wall time |
 | `summary.json` | mean, std, median and a 95% t interval across runs |
 | `config.yaml` | the resolved config of the latest job |
 | `stdout_run<i>[_<j>...].log` | everything a job printed, including from spawned DDP ranks, named by its runs |
@@ -84,10 +85,10 @@ And per run, in `run_<i>/`:
 | file | what |
 |---|---|
 | `train.csv` `valid.csv` | per-epoch `loss` and the pixel metrics |
-| `test.csv` | the same for test, with `experiment.test_every_epoch=true` |
+| `test.csv` `test_satellite.csv` | the same per test loader, with `experiment.test_every_epoch=true` |
 | `_epoch_.csv` | per-epoch `lr` and `momentum` |
 | `run_summary.json` | best epoch, best metrics, seeds, wall time |
-| `test_predictions.npz` | `index`, predicted and target masks of every test scene, and the `epoch` of the weights |
+| `<test>_predictions.npz` | per test loader: `index`, `kind` (0 satellite, 1 shapes, 2 patches), predicted and target masks of every scene, and the `epoch` of the weights |
 | `curves.png` | per-epoch LR, loss, mIoU and accuracy, with the run's info |
 | `model.best.pth` | weights from the best epoch |
 | `model.best_<metric>.pth` | weights from the best epoch of each extra selection |
@@ -98,7 +99,7 @@ and the detail, in `run_<i>/more/`:
 | file | what |
 |---|---|
 | `run_config.yaml` | the config plus every seed, enough to reproduce this run |
-| `test_preds_rank<r>.npz` | each rank's part of `test_predictions.npz` |
+| `<test>_preds_rank<r>.npz` | each rank's part of `<test>_predictions.npz` |
 
 Rerunning a run clears its directory first — nothing is deleted, the
 old artefacts move to `backup_<timestamp>/`. With `experiment.resume=true` it instead continues from an interrupted run, or restarts it if `experiment.save_state=false`.
@@ -111,8 +112,8 @@ Five knobs, one per thing that can vary:
 |---|---|---|
 | `data.params.seed_train` | the training scenes, with the run and epoch: `scene_seed(seed_train, run, epoch, index)` | — |
 | `data.params.seed_valid` | the valid set, `scene_seed(seed_valid, index)`: the same scenes every epoch, run and rerun | — |
-| `data.params.seed_test` | the test set, likewise | — |
-| `experiment.global_seed` | the base Catalyst reseeds the global RNG from (dropout, augmentation); data order is fixed | — |
+| `data.params.seed_test` | every test set, likewise | — |
+| `experiment.sampler_seed` | the train data order within an epoch (valid and test keep index order), and the base Catalyst reseeds the global RNG from (dropout, augmentation) | — |
 | `model.init_seed` | the model initialisation, offset by the run: `init_seed + run_idx` | a random init each run |
 
 All five are recorded in `run_config.yaml`, `run_summary.json` and `runs.csv`.

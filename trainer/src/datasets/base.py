@@ -7,27 +7,33 @@ import numpy as np
 import torch
 
 
-class EpochBatchSampler:
-    """Consecutive batches of indices, each tagged with the epoch. Adapted from
-    ``DBBatchSampler`` in mindfultensors:
+class SeededBatchSampler:
+    """Vendored from ``DBBatchSampler`` in mindfultensors:
     https://github.com/neuroneural/mindfultensors/blob/main/mindfultensors/utils.py
+
 
     Passed as ``sampler=`` (not ``batch_sampler=``), which is what makes each yielded
     item arrive at ``__getitem__`` as a single "index". The item is ``(epoch, indices)``:
     workers see only what the sampler yields, so this is how the epoch reaches them.
-    No shuffling: every scene is random by its seed, so order carries no information.
+    ``shuffle=False`` keeps the index order (valid and test).
     """
 
-    def __init__(self, data_source, batch_size=1):
+    def __init__(self, data_source, batch_size=1, seed=None, shuffle=True):
         self.data_size = len(data_source)
         self.batch_size = batch_size
+        self.seed = seed
+        self.shuffle = shuffle
         self.epoch = 0
 
     def set_epoch(self, epoch):  # called by accelerate before every epoch, and on resume
         self.epoch = epoch
 
     def __iter__(self):
-        return iter([(self.epoch, batch) for batch in self._batches(np.arange(self.data_size))])
+        order = np.arange(self.data_size)
+        if self.shuffle:
+            rng = np.random.default_rng(None if self.seed is None else self.seed + self.epoch)
+            order = rng.permutation(self.data_size)
+        return iter([(self.epoch, batch) for batch in self._batches(order)])
 
     def _batches(self, order):
         """Split an ordering into batches, leaving no batch of one."""
@@ -45,7 +51,7 @@ class EpochBatchSampler:
 
 
 def collate_volumes(results):
-    """``[{index: record}]`` -> ``(inputs [B,C,H,W], masks [B,H,W], indices [B])``.
+    """``[{index: record}]`` -> ``(inputs [B,C,H,W], masks [B,H,W], indices [B], kinds [B])``.
 
     ``indices`` are positions within the loader's split; with the split's seeds they
     identify the scene (see ``HSISplit.seed``).
@@ -54,5 +60,6 @@ def collate_volumes(results):
     inputs = torch.stack([record["input"] for record in results.values()])
     labels = torch.stack([record["label"] for record in results.values()])
     indices = torch.tensor([record["index"] for record in results.values()])
-    return inputs, labels.long(), indices.long()
+    kinds = torch.tensor([record["kind"] for record in results.values()])
+    return inputs, labels.long(), indices.long(), kinds.long()
 
