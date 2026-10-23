@@ -7,29 +7,27 @@ import numpy as np
 import torch
 
 
-class SeededBatchSampler:
-    """Vendored from ``DBBatchSampler`` in mindfultensors:
+class EpochBatchSampler:
+    """Consecutive batches of indices, each tagged with the epoch. Adapted from
+    ``DBBatchSampler`` in mindfultensors:
     https://github.com/neuroneural/mindfultensors/blob/main/mindfultensors/utils.py
-
 
     Passed as ``sampler=`` (not ``batch_sampler=``), which is what makes each yielded
     item arrive at ``__getitem__`` as a single "index". The item is ``(epoch, indices)``:
     workers see only what the sampler yields, so this is how the epoch reaches them.
+    No shuffling: every scene is random by its seed, so order carries no information.
     """
 
-    def __init__(self, data_source, batch_size=1, seed=None):
+    def __init__(self, data_source, batch_size=1):
         self.data_size = len(data_source)
         self.batch_size = batch_size
-        self.seed = seed
         self.epoch = 0
 
     def set_epoch(self, epoch):  # called by accelerate before every epoch, and on resume
         self.epoch = epoch
 
     def __iter__(self):
-        rng = np.random.default_rng(None if self.seed is None else self.seed + self.epoch)
-        order = rng.permutation(self.data_size)
-        return iter([(self.epoch, batch) for batch in self._batches(order)])
+        return iter([(self.epoch, batch) for batch in self._batches(np.arange(self.data_size))])
 
     def _batches(self, order):
         """Split an ordering into batches, leaving no batch of one."""
@@ -43,7 +41,6 @@ class SeededBatchSampler:
         return batches
 
     def __len__(self):
-        # sizes depend only on data_size and batch_size, not on the ordering
         return len(self._batches(np.arange(self.data_size)))
 
 

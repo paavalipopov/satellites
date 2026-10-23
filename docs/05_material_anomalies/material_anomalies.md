@@ -1,10 +1,10 @@
 # Material reflectance sheets: anomalies to check
 
-Prepared 2026-10-23 for Elena. Data: `Bus.xlsx`, `Wings.xlsx`, `antenna.xlsx`, 46 materials (35 with an irradiated spectrum). For the synthetic satellite images, each spectrum is linearly interpolated onto 36 bands over 350–1000 nm (one every 18.6 nm).
+Data: `Bus.xlsx`, `Wings.xlsx`, `antenna.xlsx`, 46 materials (35 with an irradiated spectrum).
 
-## Current handling
+## How I handle it currently
 
-1. Grid wavelengths outside a spectrum's scan take the nearest measured value: the first one at the blue end, the last one at the red end.
+1. Grid wavelengths outside material spectrum take the nearest measured value: the first one at the blue end, the last one at the red end.
 2. All values are clipped to [0, 1].
 
 On our grid, starting at 390 nm instead of 350 nm would leave no value beyond [−0.05, 1.05].
@@ -34,12 +34,6 @@ Values as they appear in the sheets (P = pristine, I = irradiated).
 
 Small gaps at the blue end are filled the same way and are negligible: Ge solar cell starts at 355.4 nm, Aluminum 6061 at 353.2 nm, Stainless_Steel_2 at 352.3 nm, Stainless_steel_1, BetaCloth and Gold_foil at 351 nm.
 
-## Beyond 1000 nm (not used yet; matters if the grid is extended)
-
-- Most spectra leave [0, 1] somewhere beyond 1400–2400 nm; Aluminum, Aluminum 6061 and CMG_with_Cu already from about 1000–1100 nm.
-- Mylar_aluminized ends at 2198 nm.
-- Most sheets have scattered missing values from about 974 nm on.
-- Si solar cell repeats 10 wavelengths between 1034 and 1097 nm, with different values.
 
 ## Questions
 

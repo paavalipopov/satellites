@@ -112,7 +112,7 @@ Five knobs, one per thing that can vary:
 | `data.params.seed_train` | the training scenes, with the run and epoch: `scene_seed(seed_train, run, epoch, index)` | — |
 | `data.params.seed_valid` | the valid set, `scene_seed(seed_valid, index)`: the same scenes every epoch, run and rerun | — |
 | `data.params.seed_test` | the test set, likewise | — |
-| `experiment.sampler_seed` | the data order within an epoch, and the base Catalyst reseeds the global RNG from (dropout, augmentation) | — |
+| `experiment.global_seed` | the base Catalyst reseeds the global RNG from (dropout, augmentation); data order is fixed | — |
 | `model.init_seed` | the model initialisation, offset by the run: `init_seed + run_idx` | a random init each run |
 
 All five are recorded in `run_config.yaml`, `run_summary.json` and `runs.csv`.

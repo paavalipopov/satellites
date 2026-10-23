@@ -74,7 +74,7 @@ class HSISplit(Dataset):
         return scene_seed(*self.keys, *([epoch] if self.fresh else []), index)
 
     def __getitem__(self, item):
-        epoch, batch = item  # what SeededBatchSampler yields
+        epoch, batch = item  # what EpochBatchSampler yields
         results = {}
         for index in map(int, batch):
             sample = generate_sample(self.cfg, self.seed(epoch, index), self.library, scene=self.scene)

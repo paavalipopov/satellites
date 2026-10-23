@@ -24,7 +24,7 @@ experiment:
   run_idx: 0             # run(s) THIS job trains, e.g. [0,1,2]; each has its own training scenes
                          # and model init, all share the valid and test sets
 
-  sampler_seed: 42       # seed for data order within an epoch
+  global_seed: 42        # catalyst reseeds the global RNG from it (dropout and the like) # TODO are you sure this statement is correct? before I had to use this fixed seed in samplers to make sure that they don't shuffle differently each epoch. I don't really need to fix the seed for dropout and the like, but I need to be sure that samplers behave consistently across epochs.
 
   selection: [miou, loss]  # valid metrics (loss, accuracy, miou, macro_f1, fg_accuracy, fg_f1) that
                            # each pick a best epoch; the first one's model is tested, the rest only save weights

@@ -163,7 +163,8 @@ class SegmentationMeter:
     def update(self, pred, target):
         """Count a batch of ``[B,H,W]`` predicted and target masks."""
         k = self.n_classes
-        self.confusion += torch.bincount((target * k + pred).flatten(), minlength=k * k).view(k, k) # TODO: are you sure it's gonna work correctly? is `target * k + pred` logic right here? feels to me liek ti should be `target * k - pred`, but I might be missing how it works.
+        # pair (t, p) -> flat index t * k + p, i.e. row t, column p after .view(k, k) # TODO still not clear how bincount computes the confusion; when the answer is correct, what gets added?
+        self.confusion += torch.bincount((target * k + pred).flatten(), minlength=k * k).view(k, k)
 
     def compute(self, reduce=None):
         """The metrics over every pixel counted; ``reduce`` sums the counts across ranks."""

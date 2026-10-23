@@ -22,7 +22,7 @@ from scipy import stats
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
-from src.datasets.base import SeededBatchSampler, collate_volumes
+from src.datasets.base import EpochBatchSampler, collate_volumes
 from src.registry import build_dataset, build_model, resolve_params
 from src.utils import (
     ModelCheckpoint,
@@ -102,7 +102,7 @@ class CustomRunner(dl.Runner):
         augmentations. Within one epoch the value does not change, so the per-loader call
         just rewinds the stream.
         """
-        return self.cfg.experiment.sampler_seed
+        return self.cfg.experiment.global_seed
 
     def on_experiment_start(self, runner):
         torch.backends.cudnn.benchmark = self.cfg.experiment.cudnn_benchmark
@@ -156,9 +156,7 @@ class CustomRunner(dl.Runner):
             # engine.prepare() already shards the DataLoader, so pre-sharding here would
             # shard twice and drop ~(1 - 1/world_size) of the data each epoch.
             kwargs = {
-                "sampler": SeededBatchSampler(
-                    subset, experiment.batch_size, experiment.sampler_seed
-                ),
+                "sampler": EpochBatchSampler(subset, experiment.batch_size),
                 "collate_fn": collate_volumes,
                 "pin_memory": True,
                 "num_workers": num_workers,
@@ -182,7 +180,7 @@ class CustomRunner(dl.Runner):
             "seed_train": data.seed_train,
             "seed_valid": data.seed_valid,
             "seed_test": data.seed_test,
-            "sampler_seed": self.cfg.experiment.sampler_seed,
+            "global_seed": self.cfg.experiment.global_seed,
             "model_init_seed": self._init_seed(),
         }
 
@@ -432,7 +430,7 @@ def main(cfg: DictConfig):
         # a resumed run keeps the old schedule, splits and optimizer state
         for key in ("experiment.epochs", "experiment.batch_size", "data.params.n_train",
                     "data.params.seed_train", "data.params.seed_valid", "data.params.seed_test",
-                    "experiment.sampler_seed", "runtime.world_size"):
+                    "experiment.global_seed", "runtime.world_size"):
             was = OmegaConf.select(OmegaConf.load(config_path), key)
             if was is not None and was != OmegaConf.select(cfg, key):
                 raise ValueError(
