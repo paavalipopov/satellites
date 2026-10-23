@@ -120,6 +120,7 @@ dist/
 .venv/
 venv/
 ENV/
+.claude_env/
 
 Claude outputs/
 assets/
