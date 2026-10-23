@@ -36,7 +36,7 @@ def resolve_params(section_name, cfg):
             f"params has no such key(s) for {section.name!r}: {sorted(unknown)}; "
             f"it takes {sorted(defaults.keys())}"
         )
-    section.params = OmegaConf.merge(defaults, overrides) # TODO: question, what this line does if we don't return it, is it working inplace? what does it do in place if so?
+    section.params = OmegaConf.merge(defaults, overrides)  # in place: cfg now holds the merge
     return module
 
 

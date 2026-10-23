@@ -8,7 +8,8 @@
 #SBATCH --exclude=arctrddgxa001
 #SBATCH --gres=gpu:A100:1
 #SBATCH -J satellite
-#SBATCH -D /data/users2/ppopov1/circRNA/trainer   # submit from anywhere #TODO: I think if we put . here, then it will run it from the folder where it got submitted. we can put it here, and leave a comment to run it from the trainer root
+# -D . runs in the submit folder: submit from the trainer root, `sbatch slurm/train.sh`
+#SBATCH -D .
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH -A psy53c17
 
@@ -28,10 +29,27 @@ echo "Using python from: $(which python)"
 
 # Multi-GPU: raise --gres=gpu:A100:N above; SLURM_GPUS_ON_NODE drives the
 # world size, nothing here needs to change.
-# One fold (run) per array task: add --array=0-N and experiment.target_folds=[$SLURM_ARRAY_TASK_ID].
+# Several runs in parallel: add `#SBATCH --array=0-4` and set
+# experiment.run_idx=$SLURM_ARRAY_TASK_ID; all land in one experiment folder.
+# The main options, at their conf/config.yaml defaults:
 python train.py \
-    experiment.name=spectral_spatial_run1
-    # TODO: list the default configs here (not all, only important, so that I can see what I can change). ALso, make a script like that for baseline
+    experiment.name=spectral_spatial \
+    model.name=spectral_spatial \
+    experiment.run_idx=0 \
+    experiment.epochs=100 \
+    experiment.batch_size=64 \
+    optimizer.base_lr=0.001 \
+    data.params.n_train=10000 \
+    data.params.n_valid=1000 \
+    data.params.n_test=1000 \
+    data.params.seed_train=0 \
+    data.params.seed_valid=1 \
+    data.params.seed_test=2 \
+    experiment.bf16=true \
+    experiment.compile=true \
+    experiment.channels_last=true
+    # generator settings take a +, e.g. +data.params.scene=satellite,
+    # +data.params.sim.sensor_noise_std=0.05 (all in src/data_generation/config.py)
 
 sleep 5s
 echo "Job $SLURM_JOB_ID completed"

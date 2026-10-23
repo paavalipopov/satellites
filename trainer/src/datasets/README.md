@@ -7,7 +7,7 @@
 A `DATASET(params)` object that `train.py` uses through:
 
 - `n_channels`, `n_classes` — `train.py` sizes the model's `in_channels` and `num_classes` from them
-- `split(name, fold)` for `name` in train, valid, test — a torch `Dataset` per loader
+- `split(name, run)` for `name` in train, valid, test — a torch `Dataset` per loader
 
 Each split's `__getitem__` receives what `SeededBatchSampler` (`base.py`) yields, `(epoch, indices)`,
 and returns `{index: {"input": [C,H,W] float, "label": [H,W] long, "index": index}}`;
@@ -21,8 +21,8 @@ A scene is fixed by its seed:
 
 | split | seed | changes with |
 |---|---|---|
-| train | `scene_seed(seed_train, fold, epoch, index)` | every epoch and fold |
-| valid | `scene_seed(seed_valid, index)` | nothing: the same set every epoch, fold and rerun |
+| train | `scene_seed(seed_train, run, epoch, index)` | every epoch and run |
+| valid | `scene_seed(seed_valid, index)` | nothing: the same set every epoch, run and rerun |
 | test | `scene_seed(seed_test, index)` | nothing |
 
 `n_train` is the number of scenes per epoch, `n_valid` and `n_test` the fixed set sizes.

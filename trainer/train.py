@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import time
+from functools import partial
 
 import hydra
 import numpy as np
@@ -25,25 +26,25 @@ from src.datasets.base import SeededBatchSampler, collate_volumes
 from src.registry import build_dataset, build_model, resolve_params
 from src.utils import (
     ModelCheckpoint,
+    SegmentationMeter,
     clear_rundir,
     plot_curves,
-    segmentation_metrics,
     setup_distributed_port,
     tee_stdout,
     world_size_from_env,
 )
 
-METRICS = {"loss", "accuracy", "miou", "macro_f1", "fg_accuracy", "fg_f1"}  # loader metrics #TODO: I don't like having this variable, but I am not sure how to deal with it best. where the user can find what metrics are available, if the look at segmentation_metrics? 
+METRICS = {"loss", *SegmentationMeter.names}  # every loader metric; selection picks from these
 
 setup_distributed_port()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 class CustomRunner(dl.Runner):
-    """Per-pixel material classifier trainer, one fold per runner.
+    """Per-pixel material classifier trainer, one run per runner.
 
-    A fold is one training run: its own stream of fresh training scenes, the same valid
-    and test sets as every other fold.
+    A run has its own stream of fresh training scenes and its own model init; every run
+    shares the same valid and test sets.
     """
 
     def __init__(self, logdir: str, dataset, cfg):
@@ -122,20 +123,20 @@ class CustomRunner(dl.Runner):
 
     def get_loaders(self):
         experiment, runtime = self.cfg.experiment, self.cfg.runtime
-        # fresh train scenes per epoch and fold; valid and test fixed by their seeds
+        # fresh train scenes per epoch and run; valid and test fixed by their seeds
         splits = {
-            key: self.dataset.split(key, fold=runtime.fold_idx) for key in ("train", "valid", "test") # TODO fold_idx, "fold" again. please rename
+            key: self.dataset.split(key, run=runtime.run_idx) for key in ("train", "valid", "test")
         }
         self._split_sizes = {name: len(split) for name, split in splits.items()}
         print(
-            f"[Fold {runtime.fold_idx}] "
+            f"[Run {runtime.run_idx}] "
             + " ".join(f"{k}={v}" for k, v in self._split_sizes.items())
         )
 
         if self.engine.is_main_process:
-            # everything needed to reproduce this fold, seeds included
-            fold_cfg = {
-                "fold_idx": runtime.fold_idx,
+            # everything needed to reproduce this run, seeds included
+            run_cfg = {
+                "run_idx": runtime.run_idx,
                 "seeds": self._seeds(),
                 "world_size": self.engine.num_processes,
                 "max_lr": runtime.max_lr,
@@ -144,8 +145,8 @@ class CustomRunner(dl.Runner):
                 "split_sizes": self._split_sizes,
                 "config": self._hparams,
             }
-            with open(os.path.join(self._moredir, "fold_config.yaml"), "w") as handle:
-                yaml.safe_dump(fold_cfg, handle, indent=4, sort_keys=False)
+            with open(os.path.join(self._moredir, "run_config.yaml"), "w") as handle:
+                yaml.safe_dump(run_cfg, handle, indent=4, sort_keys=False)
 
         loaders = {}
         for key, subset in splits.items():
@@ -182,14 +183,19 @@ class CustomRunner(dl.Runner):
             "seed_valid": data.seed_valid,
             "seed_test": data.seed_test,
             "sampler_seed": self.cfg.experiment.sampler_seed,
-            "model_init_seed": self.cfg.model.init_seed,
+            "model_init_seed": self._init_seed(),
         }
+
+    def _init_seed(self):
+        init_seed = self.cfg.model.init_seed
+        return None if init_seed is None else init_seed + self.cfg.runtime.run_idx
 
     def get_model(self):
         # fixed init, with the global RNG stream restored so it is not perturbed
-        if self.cfg.model.init_seed is not None:
+        init_seed = self._init_seed()
+        if init_seed is not None:
             rng_state = torch.get_rng_state()
-            torch.manual_seed(self.cfg.model.init_seed)
+            torch.manual_seed(init_seed)
 
         model = build_model(self.cfg)
         if self.cfg.experiment.paths.init_weights:  # start from saved weights (not a resume)
@@ -199,9 +205,9 @@ class CustomRunner(dl.Runner):
         if self.cfg.experiment.compile:  # in place, keeps state_dict keys
             model.compile()
 
-        if self.cfg.model.init_seed is not None:
+        if init_seed is not None:
             torch.set_rng_state(rng_state)
-            print(f"Model initialized with fixed seed {self.cfg.model.init_seed}")
+            print(f"Model initialized with fixed seed {init_seed}")
         return model
 
     def get_criterion(self):
@@ -223,7 +229,7 @@ class CustomRunner(dl.Runner):
 
     def get_callbacks(self):
         return {
-            # best weights per selection metric, and the state for a mid-fold resume
+            # best weights per selection metric, and the state for a mid-run resume
             "checkpoint": ModelCheckpoint(
                 self._logdir,
                 self.cfg.experiment.selection,
@@ -236,22 +242,23 @@ class CustomRunner(dl.Runner):
     def on_loader_start(self, runner):
         super().on_loader_start(runner)
 
-        # initialize metrics; the pixel metrics all come from the confusion counts
-        self.meters = {"loss": metrics.AdditiveMetric()}
-        self.confusion = torch.zeros(
-            self.n_classes, self.n_classes, dtype=torch.long, device=self.engine.device
-        ) #TODO I guess defining self.confusion and self.test_preds this way will work, but can it be done a bit more elegantly? can we wrap our metrics into catalyst meter classes? we can put them into utils for better organization. will it save us any code/clarity?
-        self.test_preds = []  # (index, predicted mask, target mask) per batch, test only # TODO is it ok to create it for every dataloader, even tain val?
+        # initialize metrics
+        self.meters = {
+            "loss": metrics.AdditiveMetric(),
+            "pixels": SegmentationMeter(self.n_classes, self.engine.device),
+        }
+        # (index, predicted mask, target mask) per batch, saved for test only
+        self.test_preds = [] if self.loader_key == "test" else None
 
     def on_loader_end(self, runner):
         # compute the loader's metrics
         self.loader_metrics["loss"] = self.meters["loss"].compute()[0]
-        # summed over ranks first, so the metrics see every pixel
-        confusion = self.engine.reduce(self.confusion, reduction="sum").cpu()
-        self.loader_metrics.update(segmentation_metrics(confusion))
+        # counts summed over ranks first, so the metrics see every pixel
+        reduce = partial(self.engine.reduce, reduction="sum")
+        self.loader_metrics.update(self.meters["pixels"].compute(reduce))
 
         # predicted masks, merged across ranks in on_experiment_end
-        if self.loader_key == "test":
+        if self.test_preds is not None:
             index, pred, target = (torch.cat(column).numpy() for column in zip(*self.test_preds))
             path = os.path.join(self._moredir, f"test_preds_rank{self.engine.process_index}.npz")
             np.savez_compressed(path, index=index, pred=pred, target=target)
@@ -298,9 +305,9 @@ class CustomRunner(dl.Runner):
             np.savez_compressed(os.path.join(self._logdir, "test_predictions.npz"),
                                 epoch=best["epoch"], **{k: v[keep] for k, v in preds.items()})
 
-            # save fold summary
+            # save run summary
             summary = {
-                "fold_idx": self.cfg.runtime.fold_idx,
+                "run_idx": self.cfg.runtime.run_idx,
                 "selected_on": f"{'min' if main == 'loss' else 'max'} valid/{main}",
                 "best_epoch": best["epoch"],
                 "epochs_run": int(self.epoch_step),
@@ -313,19 +320,21 @@ class CustomRunner(dl.Runner):
                 "max_lr": self.cfg.runtime.max_lr,
                 "minutes": round((time.time() - self._started) / 60, 2),
             }
-            with open(os.path.join(self._logdir, "fold_summary.json"), "w") as handle:
+            with open(os.path.join(self._logdir, "run_summary.json"), "w") as handle:
                 json.dump(summary, handle, indent=4)
 
             # training curves and run info
             plot_curves([self._logdir], self._hparams, os.path.join(self._logdir, "curves.png"))
             print(
-                f"[Fold {self.cfg.runtime.fold_idx}] best epoch {best['epoch']} "
+                f"[Run {self.cfg.runtime.run_idx}] best epoch {best['epoch']} "
                 f"(valid/{main}={best['score']:.4f})"
             )
         super().on_experiment_end(runner)
 
     def handle_batch(self, batch):
-        sample, target, index = batch   # target is [B,H,W] masks, index is the row in its split # TODO what is index? I didn't get you explanation
+        # target: [B,H,W] masks; index: each scene's position in its split, which with
+        # the split's seed gives the scene's generator seed
+        sample, target, index = batch
         if self.cfg.experiment.channels_last:
             sample = sample.contiguous(memory_format=torch.channels_last)
         autocast = torch.autocast(
@@ -349,11 +358,8 @@ class CustomRunner(dl.Runner):
         with torch.no_grad():
             pred = y_hat.argmax(1)
             accuracy = (pred == target).float().mean()
-            # pixel confusion counts, rows target, columns prediction
-            self.confusion += torch.bincount(
-                (target * self.n_classes + pred).flatten(), minlength=self.n_classes**2
-            ).view(self.n_classes, self.n_classes)
-            if self.loader_key == "test":
+            self.meters["pixels"].update(pred, target)
+            if self.test_preds is not None:
                 self.test_preds.append((index.cpu(), pred.byte().cpu(), target.byte().cpu()))
 
         # batch_metrics feeds the tqdm bar; the loader values are saved in the meters
@@ -363,26 +369,23 @@ class CustomRunner(dl.Runner):
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)
 def main(cfg: DictConfig):
-    """ Configure experiment, run the CV folds and roll them up."""
+    """ Configure experiment, train the requested runs and roll up every finished one."""
     # ===== Initial setup =====
     logdir = os.path.join(cfg.experiment.paths.logdir, cfg.experiment.name)
     os.makedirs(logdir, exist_ok=True)
-    if cfg.stream_log:  # one log per job, so parallel fold jobs don't interleave
-        folds = cfg.experiment.target_folds or []
-        tee_stdout(os.path.join(logdir, "run" + "".join(f"_fold{i}" for i in folds) + ".log"))
+    experiment = cfg.experiment
+    run_idx = experiment.run_idx
+    run_ids = list(run_idx) if OmegaConf.is_list(run_idx) else [run_idx]
+    if cfg.stream_log:  # one log per job, so parallel jobs don't interleave
+        tee_stdout(os.path.join(logdir, "stdout_run" + "_".join(map(str, run_ids)) + ".log"))
 
     # validate config
-    experiment = cfg.experiment
-    target_folds = list(
-        range(experiment.cv_folds) if experiment.target_folds is None else experiment.target_folds
-    )
     for ok, message in (
         (experiment.epochs >= 1, "epochs must be at least 1"),
-        (experiment.cv_folds >= 1, "cv_folds must be at least 1"),
-        (len(experiment.selection) > 0 and set(experiment.selection) <= METRICS, # TODO METRICS again, we can keep it as is, but a wquestion to you, how (where) can we add more metrics, in utils function? maybe keep metrics there?
+        (len(experiment.selection) > 0 and set(experiment.selection) <= METRICS,
          f"selection: a list of {', '.join(sorted(METRICS))}"),
-        (target_folds and all(0 <= i < experiment.cv_folds for i in target_folds),
-         f"target_folds must be a non-empty subset of 0..{experiment.cv_folds - 1}"),
+        (run_ids and all(isinstance(i, int) and i >= 0 for i in run_ids),
+         "run_idx must be a non-negative int or a non-empty list of them"),
     ):
         if not ok:
             raise ValueError(f"experiment.{message}")
@@ -416,17 +419,17 @@ def main(cfg: DictConfig):
     )
 
     # ===== Resumed experiment routines =====
-    # recovers the completed folds and continues from there
+    # recovers the completed runs and continues from there
     resume = cfg.experiment.resume
     config_path = os.path.join(logdir, "config.yaml")
     if resume:
         done = [
-            i for i in target_folds
-            if os.path.isfile(os.path.join(logdir, f"fold_{i}", "fold_summary.json"))
+            i for i in run_ids
+            if os.path.isfile(os.path.join(logdir, f"run_{i}", "run_summary.json"))
         ]
-        print(f"[Resume] on; folds already complete: {done}")
+        print(f"[Resume] on; runs already complete: {done}")
 
-        # a resumed fold keeps the old schedule, splits and optimizer state
+        # a resumed run keeps the old schedule, splits and optimizer state
         for key in ("experiment.epochs", "experiment.batch_size", "data.params.n_train",
                     "data.params.seed_train", "data.params.seed_valid", "data.params.seed_test",
                     "experiment.sampler_seed", "runtime.world_size"):
@@ -444,101 +447,100 @@ def main(cfg: DictConfig):
             OmegaConf.to_container(cfg, resolve=True), handle, indent=4, sort_keys=False
         )
 
-    # ===== CV loop =====
+    # ===== Run loop =====
+    for position, run_idx in enumerate(run_ids, start=1):
+        rundir = os.path.join(logdir, f"run_{run_idx}")
+        if resume and os.path.isfile(os.path.join(rundir, "run_summary.json")):
+            print(f"[Resume] run {run_idx} ({position}/{len(run_ids)}) done, skipping")
+            continue
+        print(f"Starting run {run_idx} ({position}/{len(run_ids)})")
+        os.makedirs(rundir, exist_ok=True)
+
+        # pick an interrupted run up where it stopped, or start it fresh
+        state = os.path.join(rundir, "state.last.pth")
+        resume_runner = state if resume and os.path.isfile(state) else ""
+        if resume_runner:
+            print(f"[Resume] continuing run {run_idx} from state.last.pth")
+        else:  # drop what an earlier run left here
+            clear_rundir(rundir)
+
+        # TRAIN THE RUN
+        cfg.runtime.run_idx = run_idx
+        cfg.runtime.resume_runner = resume_runner
+        runner = CustomRunner(logdir=rundir, dataset=dataset, cfg=cfg)
+        runner.run()
+
+        # GC step; the run is done, so its resume state can go
+        del runner
+        torch.cuda.empty_cache()
+        gc.collect()
+        if os.path.isfile(state):
+            os.remove(state)
+        if not os.path.isfile(os.path.join(rundir, "run_summary.json")):
+            print(f"[Warn] run {run_idx} produced no run_summary.json")
+
+    # ===== Summary over every finished run, from this job or others =====
     rows = []
-    for position, fold_idx in enumerate(target_folds, start=1):
-        rundir = os.path.join(logdir, f"fold_{fold_idx}")
-        if resume and os.path.isfile(os.path.join(rundir, "fold_summary.json")):
-            print(f"[Resume] fold {fold_idx} ({position}/{len(target_folds)}) done, skipping")
-        else:
-            print(f"Starting fold {fold_idx} ({position}/{len(target_folds)})")
-            os.makedirs(rundir, exist_ok=True)
+    for best_path in glob.glob(os.path.join(logdir, "run_*", "run_summary.json")):
+        with open(best_path) as handle:
+            best = json.load(handle)
 
-            # pick an interrupted fold up where it stopped, or start it fresh
-            state = os.path.join(rundir, "state.last.pth")
-            resume_runner = state if resume and os.path.isfile(state) else ""
-            if resume_runner:
-                print(f"[Resume] continuing fold {fold_idx} from state.last.pth")
-            else:  # drop what an earlier run left here
-                clear_rundir(rundir)
-
-            # RUN THE FOLD
-            cfg.runtime.fold_idx = fold_idx
-            cfg.runtime.resume_runner = resume_runner
-            runner = CustomRunner(logdir=rundir, dataset=dataset, cfg=cfg)
-            runner.run()
-
-            # GC step; the fold is done, so its resume state can go
-            del runner
-            torch.cuda.empty_cache()
-            gc.collect()
-            if os.path.isfile(state):
-                os.remove(state)
-            if not os.path.isfile(os.path.join(rundir, "fold_summary.json")):
-                print(f"[Warn] fold {fold_idx} produced no fold_summary.json")
-
-        # aggregate fold results from finished logs; rebuilt after every fold for freshness
-        rows = []
-        for best_path in glob.glob(os.path.join(logdir, "fold_*", "fold_summary.json")):
-            with open(best_path) as handle:
-                best = json.load(handle)
-
-            valid, test = best["metrics"].get("valid", {}), best["metrics"].get("test", {})
-            rows.append(
-                {
-                    "fold": best["fold_idx"],
-                    **{f"n_{name}": size for name, size in best["split_sizes"].items()},
-                    "epochs_run": best["epochs_run"],
-                    "best_epoch": best["best_epoch"],
-                    **{f"best_epoch@{m}": b["epoch"] for m, b in best.get("bests", {}).items()},
-                    **{f"valid_{key}": value for key, value in valid.items()},
-                    **{f"test_{key}": value for key, value in test.items()},
-                    **{f"test_{k}@{m}": v for m, b in best.get("bests", {}).items()
-                       for k, v in b["metrics"].get("test", {}).items()},
-                    **best["seeds"],
-                    "world_size": best["world_size"],
-                    "batch_size_per_rank": best["batch_size_per_rank"],
-                    "max_lr": best["max_lr"],
-                    "minutes": best["minutes"],
-                }
-            )
-        rows.sort(key=lambda row: row["fold"])
-        with open(os.path.join(logdir, "CV_records.csv"), "w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list({k: 0 for row in rows for k in row}))
-            writer.writeheader()
-            writer.writerows(rows)
-
-    # === Complete CV summary ===
-    if len(rows) < cfg.experiment.cv_folds:
-        print(f"[CV] {len(rows)}/{cfg.experiment.cv_folds} folds done; no summary yet")
-    else:
-        summary = {"n_folds": len(rows)}
-        for key in [c for c in rows[0] if c.startswith(("valid_", "test_"))]:
-            values = [row[key] for row in rows if row.get(key) is not None]
-            if not values:
-                continue
-            # 95% t interval on the mean across folds
-            mean, n = float(np.mean(values)), len(values)
-            half = (
-                stats.t.ppf(0.975, n - 1) * float(np.std(values, ddof=1)) / np.sqrt(n)
-                if n > 1
-                else float("nan")
-            )
-            summary[key] = {
-                "mean": mean,
-                "std": float(np.std(values)),
-                "median": float(np.median(values)),
-                "ci95": [mean - half, mean + half],
+        valid, test = best["metrics"].get("valid", {}), best["metrics"].get("test", {})
+        rows.append(
+            {
+                "run": best["run_idx"],
+                **{f"n_{name}": size for name, size in best["split_sizes"].items()},
+                "epochs_run": best["epochs_run"],
+                "best_epoch": best["best_epoch"],
+                **{f"best_epoch@{m}": b["epoch"] for m, b in best.get("bests", {}).items()},
+                **{f"valid_{key}": value for key, value in valid.items()},
+                **{f"test_{key}": value for key, value in test.items()},
+                **{f"test_{k}@{m}": v for m, b in best.get("bests", {}).items()
+                   for k, v in b["metrics"].get("test", {}).items()},
+                **best["seeds"],
+                "world_size": best["world_size"],
+                "batch_size_per_rank": best["batch_size_per_rank"],
+                "max_lr": best["max_lr"],
+                "minutes": best["minutes"],
             }
-            if key.startswith("test"):
-                print(f"[CV] {key}: {summary[key]['mean']:.4f} +/- {summary[key]['std']:.4f}")
-        with open(os.path.join(logdir, "summary.json"), "w") as handle:
-            json.dump(summary, handle, indent=4)
+        )
+    if not rows:
+        print("[Runs] no finished run yet; no summary")
+        return
+    rows.sort(key=lambda row: row["run"])
+    with open(os.path.join(logdir, "runs.csv"), "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list({k: 0 for row in rows for k in row}))
+        writer.writeheader()
+        writer.writerows(rows)
 
-        # every fold's curves in one figure
-        rundirs = [os.path.join(logdir, f"fold_{row['fold']}") for row in rows]
-        plot_curves(rundirs, OmegaConf.to_container(cfg, resolve=True),
-                    os.path.join(logdir, "curves.png"))
+    summary = {"n_runs": len(rows), "runs": [row["run"] for row in rows]}
+    for key in [c for c in rows[0] if c.startswith(("valid_", "test_"))]:
+        values = [row[key] for row in rows if row.get(key) is not None]
+        if not values:
+            continue
+        # 95% t interval on the mean across runs
+        mean, n = float(np.mean(values)), len(values)
+        half = (
+            stats.t.ppf(0.975, n - 1) * float(np.std(values, ddof=1)) / np.sqrt(n)
+            if n > 1
+            else float("nan")
+        )
+        summary[key] = {
+            "mean": mean,
+            "std": float(np.std(values)),
+            "median": float(np.median(values)),
+            "ci95": [mean - half, mean + half],
+        }
+        if key.startswith("test"):
+            print(f"[Runs] {key}: {summary[key]['mean']:.4f} +/- {summary[key]['std']:.4f}")
+
+    with open(os.path.join(logdir, "summary.json"), "w") as handle:
+        json.dump(summary, handle, indent=4)
+
+    # every run's curves in one figure
+    rundirs = [os.path.join(logdir, f"run_{row['run']}") for row in rows]
+    plot_curves(rundirs, OmegaConf.to_container(cfg, resolve=True),
+                os.path.join(logdir, "curves.png"))
 
 
 if __name__ == "__main__":

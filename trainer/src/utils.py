@@ -139,50 +139,71 @@ class ModelCheckpoint(dl.ICheckpointCallback):
             self._save(runner, state, os.path.join(self.logdir, "state.last.pth"))
 
 
-def segmentation_metrics(confusion):
-    """Pixel metrics from a ``[K, K]`` confusion matrix (rows target, columns prediction).
+class SegmentationMeter:
+    """Pixel confusion counts over one loader pass, and the metrics computed from them.
 
+    Same reset/update/compute shape as catalyst's meters. To add a metric, add it to
+    ``compute()`` and its name to ``names``: ``experiment.selection`` accepts it then.
     Class 0 is background. ``miou`` and ``macro_f1`` average over the classes present in
     the target or the prediction; ``fg_*`` treat every material as one foreground class.
     """
-    confusion = confusion.double()
-    tp = confusion.diag()
-    fp, fn = confusion.sum(0) - tp, confusion.sum(1) - tp
-    seen = (tp + fp + fn) > 0
 
-    # foreground: is it a material at all, and which one
-    fg_tp, fg_fp, fg_fn = confusion[1:, 1:].sum(), confusion[0, 1:].sum(), confusion[1:, 0].sum()
-    fg_pixels = confusion[1:].sum().clamp_min(1)
-    return {
-        "accuracy": float(tp.sum() / confusion.sum().clamp_min(1)),
-        "miou": float((tp / (tp + fp + fn).clamp_min(1))[seen].mean()),
-        "macro_f1": float((2 * tp / (2 * tp + fp + fn).clamp_min(1))[seen].mean()),
-        "fg_accuracy": float(tp[1:].sum() / fg_pixels),
-        "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
-    }
+    names = ("accuracy", "miou", "macro_f1", "fg_accuracy", "fg_f1")
+
+    def __init__(self, n_classes, device):
+        self.n_classes, self.device = n_classes, device
+        self.reset()
+
+    def reset(self):
+        # rows target, columns prediction
+        self.confusion = torch.zeros(
+            self.n_classes, self.n_classes, dtype=torch.long, device=self.device
+        )
+
+    def update(self, pred, target):
+        """Count a batch of ``[B,H,W]`` predicted and target masks."""
+        k = self.n_classes
+        self.confusion += torch.bincount((target * k + pred).flatten(), minlength=k * k).view(k, k) # TODO: are you sure it's gonna work correctly? is `target * k + pred` logic right here? feels to me liek ti should be `target * k - pred`, but I might be missing how it works.
+
+    def compute(self, reduce=None):
+        """The metrics over every pixel counted; ``reduce`` sums the counts across ranks."""
+        confusion = (reduce(self.confusion) if reduce else self.confusion).double().cpu()
+        tp = confusion.diag()
+        fp, fn = confusion.sum(0) - tp, confusion.sum(1) - tp
+        seen = (tp + fp + fn) > 0
+
+        # foreground: is it a material at all, and which one
+        fg_tp, fg_fp, fg_fn = confusion[1:, 1:].sum(), confusion[0, 1:].sum(), confusion[1:, 0].sum()
+        fg_pixels = confusion[1:].sum().clamp_min(1)
+        return {
+            "accuracy": float(tp.sum() / confusion.sum().clamp_min(1)),
+            "miou": float((tp / (tp + fp + fn).clamp_min(1))[seen].mean()),
+            "macro_f1": float((2 * tp / (2 * tp + fp + fn).clamp_min(1))[seen].mean()),
+            "fg_accuracy": float(tp[1:].sum() / fg_pixels),
+            "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
+        }
 
 
 def run_info(summaries, cfg):
-    """Plain-text description of one or more folds, for the info panel of curves.png."""
+    """Plain-text description of one or more runs, for the info panel of curves.png."""
     params, first = cfg["data"]["params"], summaries[0]
     shown = ("n_train", "n_valid", "n_test", "scene")
     lines = [
         f"experiment  {cfg['experiment']['name']}",
-        f"folds       {', '.join(str(s['fold_idx']) for s in summaries)} "
-        f"of {cfg['experiment']['cv_folds']}",
+        f"runs        {', '.join(str(s['run_idx']) for s in summaries)}",
         f"data        {cfg['data']['name']}: "
         + ", ".join(f"{key}={params[key]}" for key in shown if key in params),
         "split       " + ", ".join(f"{k} {v}" for k, v in first["split_sizes"].items())
-        + (f" (fold {first['fold_idx']})" if len(summaries) > 1 else ""),
+        + (f" (run {first['run_idx']})" if len(summaries) > 1 else ""),
         f"model       {cfg['model']['name']}, {cfg['runtime']['n_channels']} channel(s)",
         f"training    {first['epochs_run']} epochs, batch {first['batch_size_per_rank']}"
         f" x {first['world_size']} rank(s), max_lr {first['max_lr']:.4g}, "
-        f"{np.mean([s['minutes'] for s in summaries]):.0f} min/fold",
+        f"{np.mean([s['minutes'] for s in summaries]):.0f} min/run",
         f"best epoch  {', '.join(str(s['best_epoch']) for s in summaries)}, "
         f"{first['selected_on']} (dots)",
     ]
 
-    # metrics at each fold's best epoch, mean±sd over folds
+    # metrics at each run's best epoch, mean±sd over runs
     for name in ("train", "valid", "test"):
         keys = sorted(first["metrics"].get(name, {}))
         values = {k: [s["metrics"][name][k] for s in summaries] for k in keys}
@@ -191,14 +212,14 @@ def run_info(summaries, cfg):
                 f"{k} {np.mean(v):.3f}" + (f"±{np.std(v):.3f}" if len(v) > 1 else "")
                 for k, v in values.items()
             ))
-    lines.append("curves      train blue, valid orange, test green if logged; one line per fold")
+    lines.append("curves      train blue, valid orange, test green if logged; one line per run")
     return "\n".join(textwrap.fill(line, 74, subsequent_indent=" " * 12) for line in lines)
 
 
 def plot_curves(rundirs, cfg, path):
-    """Save the training curves of one or more folds as ``path``, one line per fold.
+    """Save the training curves of one or more runs as ``path``, one line per run.
 
-    Reads each fold's csv logs and fold_summary.json, so it works on finished runs too.
+    Reads each run's csv logs and run_summary.json, so it works on finished runs too.
     Never raises: a plotting problem must not cost a finished run.
     """
     try:
@@ -211,7 +232,7 @@ def plot_curves(rundirs, cfg, path):
         alpha = 1 if len(rundirs) == 1 else 0.5
         summaries = []
         for i, rundir in enumerate(rundirs):
-            # per-epoch logs as {column: array}, and the fold's summary
+            # per-epoch logs as {column: array}, and the run's summary
             logs = {}
             for name in ("train", "valid", "test", "_epoch_"):
                 log_path = os.path.join(rundir, f"{name}.csv")
@@ -220,7 +241,7 @@ def plot_curves(rundirs, cfg, path):
                 with open(log_path) as handle:
                     rows = list(csv.DictReader(handle))
                 logs[name] = {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
-            with open(os.path.join(rundir, "fold_summary.json")) as handle:
+            with open(os.path.join(rundir, "run_summary.json")) as handle:
                 summaries.append(json.load(handle))
             best, test = summaries[-1]["best_epoch"], summaries[-1]["metrics"].get("test", {})
             hide = "_" if i else ""  # "_" labels stay out of the legend

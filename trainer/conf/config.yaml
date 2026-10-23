@@ -13,17 +13,16 @@ data:
     n_train: 10000       # fresh training scenes per epoch
     n_valid: 1000        # valid and test: the same scenes every epoch and rerun
     n_test: 1000
-    seed_train: 0        # training scenes also depend on the fold and epoch
+    seed_train: 0        # training scenes also depend on the run and epoch
     seed_valid: 1
     seed_test: 2
 
 experiment:
-  name: test             # name for logs; logs land in <paths.logdir>/<name>/fold_N
+  name: test             # name for logs; logs land in <paths.logdir>/<name>/run_N
   epochs: 100            # total number of training epochs
   batch_size: 64         # number of samples per step, PER RANK
-  cv_folds: 1            # number of runs ("folds"): each trains on its own fresh scenes,
-                         # all share the valid and test sets
-  target_folds: null     # which folds THIS job runs, e.g. [0,1]; null = all of them # TODO: so, folds. I mentioned about it in the chat, I think we can rename it to run_idx or something like that. we can set default to 0, I guess it's easiest way to do it? also, to make runs different, shall we add this idx to seed_train in the code, or some other random seed?
+  run_idx: 0             # run(s) THIS job trains, e.g. [0,1,2]; each has its own training scenes
+                         # and model init, all share the valid and test sets
 
   sampler_seed: 42       # seed for data order within an epoch
 
@@ -34,16 +33,16 @@ experiment:
     logdir: ./logs       # path to the directory where logs will be stored
     init_weights: null   # checkpoint to initialise the model from (not a run resume)
 
-  resume: False          # skip finished folds, continue an interrupted one from its last epoch
-  save_state: True       # per-epoch state.last.pth, for mid-fold resume
+  resume: False          # skip finished runs, continue an interrupted one from its last epoch
+  save_state: True       # per-epoch state.last.pth, for mid-run resume
   cudnn_benchmark: True  # autotune conv kernels; cubes are fixed-size
   bf16: True             # bf16 autocast; weights and optimizer stay fp32
-  channels_last: False   # channels_last memory layout for the 2D convs; fails on basic_3dcnn
+  channels_last: True    # channels_last memory layout for the 2D convs; fails on basic_3dcnn
   compile: True          # torch.compile: slower start, faster steps
 
 model:
   name: spectral_spatial # a module in src/models/; its default_HPs() holds the defaults
-  init_seed: 42          # identical model init across folds and ranks (null = random)
+  init_seed: 42          # run i initialises from init_seed + i, same on every rank (null = random)
   params: {}             # override any default_HPs() key, e.g. +model.params.hidden_channels=32 (basic_3dcnn)
 
 optimizer:
@@ -62,17 +61,17 @@ loader:
     persistent_workers: True
     prefetches: 2
 
-wandb:                   # needs `pip install wandb`; one run per fold
+wandb:                   # needs `pip install wandb`; one wandb run per run
   project: null          # wandb project; null keeps wandb off entirely
   entity: null           # team or user; null = your wandb default
   name: null             # run name; null = experiment.name, matching the log folder
 
 runtime:                 # filled in by train.py at startup; not for hand editing
-  fold_idx: null
+  run_idx: null          # the run being trained
   world_size: null
   n_channels: null       # read off the dataset; the model's in_channels defaults to it
   n_classes: null        # distinct labels in the dataset; the model's n_classes defaults to it
   max_lr: null           # base_lr after scale_lr
-  resume_runner: null    # checkpoint an interrupted fold is continuing from
+  resume_runner: null    # checkpoint an interrupted run is continuing from
 
-stream_log: True         # tee stdout into <experiment>/run.log, run_fold<i>.log with target_folds
+stream_log: True         # tee stdout into <experiment>/stdout_run<i>[_<j>...].log, one per job

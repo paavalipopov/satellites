@@ -3,7 +3,7 @@
 ``data.name=hsi``. One ``HSIDataset`` holds the generator settings and the material
 library; ``split()`` gives each loader its own dataset. Every scene is fixed by its seed:
 
-    train   scene_seed(seed_train, fold, epoch, index)   fresh every epoch and fold
+    train   scene_seed(seed_train, run, epoch, index)    fresh every epoch and run
     valid   scene_seed(seed_valid, index)                 the same set every epoch and rerun
     test    scene_seed(seed_test, index)
 """
@@ -47,16 +47,16 @@ class HSIDataset:
 
     def __init__(self, params):
         self.params = params
-        self.sim = SimConfig(**params.sim) # TODO its better to call it cfg I think?
-        self.library = SpectralLibrary(self.sim, root=str(params.material_root or PROJECT_ROOT))
-        self.n_channels = self.sim.n_bands  # main() sizes the model from these two
+        self.cfg = SimConfig(**params.sim)
+        self.library = SpectralLibrary(self.cfg, root=str(params.material_root or PROJECT_ROOT))
+        self.n_channels = self.cfg.n_bands  # main() sizes the model from these two
         self.n_classes = N_CLASSES
 
-    def split(self, name, fold=0):
+    def split(self, name, run=0):
         """The dataset for loader ``name``: train, valid or test."""
         size, seed = self.params[f"n_{name}"], self.params[f"seed_{name}"]
         if name == "train":
-            return HSISplit(self, size, keys=(seed, fold), fresh=True)
+            return HSISplit(self, size, keys=(seed, run), fresh=True)
         return HSISplit(self, size, keys=(seed,), fresh=False)
 
 
@@ -64,7 +64,7 @@ class HSISplit(Dataset):
     """``size`` scenes; ``fresh`` adds the epoch to every seed."""
 
     def __init__(self, parent, size, keys, fresh):
-        self.sim, self.library, self.scene = parent.sim, parent.library, parent.params.scene
+        self.cfg, self.library, self.scene = parent.cfg, parent.library, parent.params.scene
         self.size, self.keys, self.fresh = size, tuple(keys), fresh
 
     def __len__(self):
@@ -77,7 +77,7 @@ class HSISplit(Dataset):
         epoch, batch = item  # what SeededBatchSampler yields
         results = {}
         for index in map(int, batch):
-            sample = generate_sample(self.sim, self.seed(epoch, index), self.library, scene=self.scene)
+            sample = generate_sample(self.cfg, self.seed(epoch, index), self.library, scene=self.scene)
             results[index] = {
                 "input": torch.from_numpy(sample.cube).float(),  # [bands, H, W]
                 "label": torch.from_numpy(sample.mask).long(),   # [H, W], 0 = background

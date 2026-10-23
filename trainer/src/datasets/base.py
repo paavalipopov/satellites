@@ -23,7 +23,7 @@ class SeededBatchSampler:
         self.seed = seed
         self.epoch = 0
 
-    def set_epoch(self, epoch): #TODO why do we need to set and return epoch again?
+    def set_epoch(self, epoch):  # called by accelerate before every epoch, and on resume
         self.epoch = epoch
 
     def __iter__(self):
