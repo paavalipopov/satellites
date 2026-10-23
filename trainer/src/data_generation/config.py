@@ -23,6 +23,9 @@ class SimConfig:
     lambda_min_nm: float = 350.0
     lambda_max_nm: float = 1000.0
     n_bands: int = 36
+    # explicit band centres (nm, ascending) replace the linspace grid above when set;
+    # n_bands must match their count (e.g. a real sensor's bands)
+    wavelengths: tuple[float, ...] | None = None
 
     # ---------------- scene / camera ----------------
     image_size: int = 15
@@ -104,9 +107,21 @@ class SimConfig:
     material_dir: str = "assets/materials"     # relative to root; originals in original_files/
 
     # ------------------------------------------------------------------
+    def __post_init__(self):
+        if self.wavelengths is None:
+            return
+        wavelengths = tuple(float(w) for w in self.wavelengths)  # lists from configs too
+        object.__setattr__(self, "wavelengths", wavelengths)
+        if len(wavelengths) != self.n_bands:
+            raise ValueError(f"n_bands={self.n_bands}, but {len(wavelengths)} wavelengths given")
+        if any(b <= a for a, b in zip(wavelengths, wavelengths[1:])):
+            raise ValueError("wavelengths must be ascending; flip a red-to-blue cube instead")
+
     @property
     def wavelengths_nm(self) -> np.ndarray:
         """The band centres.  This is the array to quote to collaborators."""
+        if self.wavelengths is not None:
+            return np.array(self.wavelengths)
         return np.linspace(self.lambda_min_nm, self.lambda_max_nm, self.n_bands)
 
     @property
