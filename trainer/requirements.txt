@@ -1,0 +1,23 @@
+# pip install -r requirements.txt   (python >= 3.10)
+# Floors, not exact pins: verified on the versions in the comments and on the
+# current releases. nvidia-nccl-cu12 is deliberately absent -- torch declares it
+# for linux/x86_64 only, and pinning it here breaks macOS and aarch64 installs.
+
+torch>=2.6                  # tested 2.6.0 and 2.14.0
+numpy>=2.0
+scipy>=1.13
+scikit-learn>=1.5
+hydra-core>=1.3.2
+PyYAML>=6.0
+matplotlib>=3.8          # curves.png per fold
+
+# in-house fork with PR #2: DDP-averaged loader metrics, any loader key, true best checkpoint
+catalyst @ git+https://github.com/neuroneural/catalyst.git@7fdc25ca8769619f7c2dc0ad2f68c42408c3bf77
+accelerate>=0.20,<1.0       # catalyst shards the DataLoaders through it; catalyst
+                            # still reads DistributedType.TPU, which 1.0 removed
+tensorboardX>=2.6           # imported by catalyst.loggers regardless of use
+
+nibabel>=5.3                # .nii/.nii.gz in src/datasets/mdd.py
+pymongo>=4.6                # src/datasets/mongo.py
+lz4>=4.3                    # only if the mongo chunks are lz4-compressed
+wandb>=0.19                 # only used when wandb.project is set
