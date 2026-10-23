@@ -11,6 +11,7 @@ Defaults live with the implementation, ``<section>.params`` in the experiment co
 carries only what you want changed, and the two are merged here. An unknown key in
 ``params`` is an error rather than a silent no-op. Both builders write the merged
 params back into the config, so what gets logged is what was actually built.
+A model is built as ``MODEL(**params)``, a dataset as ``DATASET(params)``.
 """
 
 import importlib
@@ -35,12 +36,12 @@ def resolve_params(section_name, cfg):
             f"params has no such key(s) for {section.name!r}: {sorted(unknown)}; "
             f"it takes {sorted(defaults.keys())}"
         )
-    section.params = OmegaConf.merge(defaults, overrides)
+    section.params = OmegaConf.merge(defaults, overrides) # TODO: question, what this line does if we don't return it, is it working inplace? what does it do in place if so?
     return module
 
 
 def build_model(cfg):
-    return resolve_params("model", cfg).MODEL(cfg.model.params)
+    return resolve_params("model", cfg).MODEL(**cfg.model.params)
 
 
 def build_dataset(cfg):

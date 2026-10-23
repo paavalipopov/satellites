@@ -1,6 +1,8 @@
-# 3D volume classification with cross-validation
+# Per-pixel material classification of synthetic satellite HSI
 
-Binary classification of whole 3D volumes, stratified k-fold, one model per fold.
+Each scene is a [36, 15, 15] cube with a [15, 15] material mask (0 = background, 1-46 =
+materials), generated on the fly by `src/data_generation` (a copy of the project's `src/data_generation`).
+Training scenes are fresh every epoch; valid and test are fixed sets, chosen by their seeds.
 Catalyst runner, Hydra config, single- or multi-GPU on SLURM.
 
 ## Quick start
@@ -10,15 +12,15 @@ pip install -r requirements.txt
 # pip keeps an installed catalyst when only the pinned commit changes (same version), so force it
 pip install --force-reinstall --no-deps "$(grep '^catalyst' requirements.txt)"
 
-python train.py                                        # random dummy data, no setup
-python train.py --config-name=mdd_direct experiment.name=my_run   # a real dataset
-python train.py experiment.name=my_run experiment.resume=true   # continue where it stopped
+python train.py experiment.name=my_run                            # conf/config.yaml defaults
+python train.py experiment.name=my_run model.name=basic_3dcnn      # the 3D-CNN baseline
+python train.py experiment.name=my_run +data.params.sim.sensor_noise_std=0.05  # any generator setting
+python train.py experiment.name=my_run experiment.resume=true     # continue where it stopped
 ```
 
-`data.name=dummy` generates random volumes so the pipeline runs with no data at all.
-`signal` is the class blob's amplitude in units of the noise SD, with no upper bound:
-the default 0.3 is faint, and `+data.params.signal=3` is obvious enough to confirm the
-training loop really fits (test AUC goes to 1.0).
+The material sheets are read from `assets/materials` in the project root (one level above
+this folder); `+data.params.material_root=...` points elsewhere. On CPU, set
+`experiment.bf16=false` (bf16 is emulated and ~50x slower) and `loader.*.prefetches=0`.
 
 Any config key can be overridden on the command line, e.g.
 `experiment.epochs=100 experiment.batch_size=4 experiment.target_folds=[0]`.
@@ -29,16 +31,17 @@ Any config key can be overridden on the command line, e.g.
 train.py                  the entry point: CV loop + Catalyst runner
 requirements.txt          pinned deps, Catalyst from the neuroneural fork
 conf/                     run configs
-src/models/               models
-src/datasets/             datasets, and their own README
+src/models/               models: spectral_spatial (the paper's), basic_3dcnn (baseline)
+src/datasets/             datasets (hsi), and their own README
+src/data_generation/      the scene generator, copied from the project's src/
 ```
 
 ## Config sections breakdown
 
 | section | what it sets |
 |---|---|
-| `data` | dataset `name` (a module in `src/datasets/`) and `params` |
-| `experiment` | experiment `name`; experiment params like `epochs`, `batch_size` (per rank), `cv_folds`, `target_folds`, `valid_ratio`, `selection`, `test_every_epoch`; random seeds; utility params like `resume`, `save_state`, `cudnn_benchmark`, `bf16`, `channels_last`, `compile`; `paths` (`logdir`, `init_weights`: a checkpoint to start the model from) |
+| `data` | dataset `name` (a module in `src/datasets/`) and `params`: split sizes and seeds, generator settings under `sim` |
+| `experiment` | experiment `name`; experiment params like `epochs`, `batch_size` (per rank), `cv_folds` (number of runs), `target_folds`, `selection`, `test_every_epoch`; random seeds; utility params like `resume`, `save_state`, `cudnn_benchmark`, `bf16`, `channels_last`, `compile`; `paths` (`logdir`, `init_weights`: a checkpoint to start the model from) |
 | `model` | model `name` (a module in `src/models/`), `init_seed`, `params` |
 | `optimizer` | `base_lr` (per rank), and `scale_lr` for `base_lr * sqrt(world_size)` |
 | `loader` | `num_workers`, `prefetch_factor`, `persistent_workers`, `prefetches` for `train` and `eval` |
@@ -48,11 +51,18 @@ src/datasets/             datasets, and their own README
 
 `experiment.name` is the log folder name *and* the wandb run name, so a run is easy to
 trace in either direction. `experiment.selection` lists the valid metrics that each pick a
-best epoch (lowest loss, highest accuracy or AUC). The first one picks the checkpoint that is
+best epoch (lowest loss, highest of the others). The first one picks the checkpoint that is
 tested and reported; the others only save their weights (`model.best_<metric>.pth`) and best
-epoch. `experiment.selection=[auc,loss]` makes the highest valid AUC the tested model.
+epoch. `experiment.selection=[miou,loss]` makes the highest valid mIoU the tested model.
+
+A "fold" is one training run: its own stream of training scenes, the same valid and test
+sets. `cv_folds=5` gives five runs and a mean and 95% interval across them. #TODO le'ts fix 'fold'
+
+Metrics are per pixel, from the loader's confusion matrix: `accuracy`, `miou` and
+`macro_f1` (over classes present in target or prediction, background included),
+`fg_accuracy` (material accuracy on foreground pixels) and `fg_f1` (foreground vs background).
 `experiment.test_every_epoch=true` also runs test after every epoch (`test.csv`), which gives
-every selection its own test scores (`test_auc@auc`, ... in `CV_records.csv`).
+every selection its own test scores (`test_miou@miou`, ... in `CV_records.csv`).
 
 ## Logs
 
@@ -70,13 +80,12 @@ And per fold, in `fold_<i>/`:
 
 | file | what |
 |---|---|
-| `train.csv` `valid.csv` | per-epoch `accuracy, auc, loss` |
+| `train.csv` `valid.csv` | per-epoch `loss` and the pixel metrics |
 | `test.csv` | the same for test, with `experiment.test_every_epoch=true` |
 | `_epoch_.csv` | per-epoch `lr` and `momentum` |
 | `fold_summary.json` | best epoch, best metrics, seeds, wall time |
-| `test_predictions.csv` | every test sample's `logit_k, prob_k, target`, merged across ranks |
-| `split_indices.json` | the train/valid/test split as dataset indices |
-| `curves.png` | per-epoch LR, loss, AUC and accuracy, with the run's info |
+| `test_predictions.npz` | `index`, predicted and target masks of every test scene, and the `epoch` of the weights |
+| `curves.png` | per-epoch LR, loss, mIoU and accuracy, with the run's info |
 | `model.best.pth` | weights from the best epoch |
 | `model.best_<metric>.pth` | weights from the best epoch of each extra selection |
 | `state.last.pth` | weights, optimizer, scheduler and best epochs after the latest epoch, for resuming; deleted once the fold finishes |
@@ -86,21 +95,21 @@ and the detail, in `fold_<i>/more/`:
 | file | what |
 |---|---|
 | `fold_config.yaml` | the config plus every seed, enough to reproduce this fold |
-| `*_ids.txt` | the same split as readable sample ids |
-| `raw_preds_<loader>_rank<r>.csv` | every sample's `logit_k, prob_k, target` per epoch, per rank |
+| `test_preds_rank<r>.npz` | each rank's part of `test_predictions.npz` |
 
 Rerunning an experiment name clears the fold directory first — nothing is deleted, the
 old artefacts move to `backup_<timestamp>/`. With `experiment.resume=true` it instead continues from an interrupted fold, or restarts it if `experiment.save_state=false`.
 
 ## Seeds
 
-Four knobs, one per thing that can vary:
+Five knobs, one per thing that can vary:
 
 | seed | fixes | null means |
 |---|---|---|
-| `experiment.cv_seed` | the fold assignment — which samples are each fold's test set | — |
-| `experiment.train_val_seed` | the train/valid slice inside a fold | — (it defaults to `${experiment.cv_seed}`) |
+| `data.params.seed_train` | the training scenes, with the fold and epoch: `scene_seed(seed_train, fold, epoch, index)` | — |
+| `data.params.seed_valid` | the valid set, `scene_seed(seed_valid, index)`: the same scenes every epoch, fold and rerun | — |
+| `data.params.seed_test` | the test set, likewise | — |
 | `experiment.sampler_seed` | the data order within an epoch, and the base Catalyst reseeds the global RNG from (dropout, augmentation) | — |
 | `model.init_seed` | the model initialisation | a different init each fold |
 
-All four are recorded in `fold_config.yaml`, `fold_summary.json` and `CV_records.csv`.
+All five are recorded in `fold_config.yaml`, `fold_summary.json` and `CV_records.csv`.

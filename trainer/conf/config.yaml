@@ -8,42 +8,46 @@ hydra:
   run: {dir: .}          # no outputs/<date>/<time>/
 
 data:
-  name: dummy            # a module in src/datasets/; its default_HPs() holds the default params
-  params: {}             # override any default_HPs() key, e.g. +data.params.n_samples=500
+  name: hsi              # a module in src/datasets/; its default_HPs() holds the default params
+  params:                # override any default_HPs() key, e.g. +data.params.sim.sensor_noise_std=0.05
+    n_train: 10000       # fresh training scenes per epoch
+    n_valid: 1000        # valid and test: the same scenes every epoch and rerun
+    n_test: 1000
+    seed_train: 0        # training scenes also depend on the fold and epoch
+    seed_valid: 1
+    seed_test: 2
 
 experiment:
   name: test             # name for logs; logs land in <paths.logdir>/<name>/fold_N
-  epochs: 60             # total number of training epochs
-  batch_size: 8          # number of samples per step, PER RANK
-  cv_folds: 10           # number of cross-validation folds
-  target_folds: null     # which folds THIS job runs, e.g. [0,1]; null = all of them
-  valid_ratio: 0.2       # of the training part of each fold
+  epochs: 100            # total number of training epochs
+  batch_size: 64         # number of samples per step, PER RANK
+  cv_folds: 1            # number of runs ("folds"): each trains on its own fresh scenes,
+                         # all share the valid and test sets
+  target_folds: null     # which folds THIS job runs, e.g. [0,1]; null = all of them # TODO: so, folds. I mentioned about it in the chat, I think we can rename it to run_idx or something like that. we can set default to 0, I guess it's easiest way to do it? also, to make runs different, shall we add this idx to seed_train in the code, or some other random seed?
 
-  cv_seed: 42            # seed for fold assignment, i.e. which samples are the test set
-  train_val_seed: 42     # seed for train/valid slice inside a fold
   sampler_seed: 42       # seed for data order within an epoch
-  
-  selection: [loss, auc]   # valid metrics (loss, accuracy, auc, auc_weighted) that each pick a best
-                           # epoch; the first one's model is tested, the rest only save weights
-  test_every_epoch: False  # also test after every epoch: test.csv and test scores per selection
+
+  selection: [miou, loss]  # valid metrics (loss, accuracy, miou, macro_f1, fg_accuracy, fg_f1) that
+                           # each pick a best epoch; the first one's model is tested, the rest only save weights
+  test_every_epoch: True  # also test after every epoch: test.csv and test scores per selection
   paths:
     logdir: ./logs       # path to the directory where logs will be stored
     init_weights: null   # checkpoint to initialise the model from (not a run resume)
 
   resume: False          # skip finished folds, continue an interrupted one from its last epoch
   save_state: True       # per-epoch state.last.pth, for mid-fold resume
-  cudnn_benchmark: True  # autotune conv kernels; volumes are fixed-size
+  cudnn_benchmark: True  # autotune conv kernels; cubes are fixed-size
   bf16: True             # bf16 autocast; weights and optimizer stay fp32
-  channels_last: True    # channels_last_3d memory layout for the convs
+  channels_last: False   # channels_last memory layout for the 2D convs; fails on basic_3dcnn
   compile: True          # torch.compile: slower start, faster steps
 
 model:
-  name: resnet3d         # a module in src/models/; its default_HPs() holds the defaults
+  name: spectral_spatial # a module in src/models/; its default_HPs() holds the defaults
   init_seed: 42          # identical model init across folds and ranks (null = random)
-  params: {}             # override any default_HPs() key, e.g. +model.params.dropout=0.2
+  params: {}             # override any default_HPs() key, e.g. +model.params.hidden_channels=32 (basic_3dcnn)
 
 optimizer:
-  base_lr: 0.008
+  base_lr: 0.001
   scale_lr: True         # max_lr = base_lr * sqrt(world_size), Adam's scaling rule
 
 loader:

@@ -4,39 +4,28 @@
 
 ## The contract
 
-Subclass `VolumeDataset` from `base.py`:
+A `DATASET(params)` object that `train.py` uses through:
 
-- implement `load(index)` returning `[D,H,W]`, or `[C,D,H,W]` when the sample has channels
-- set `labels` (one int per sample, `0..n_classes-1`) and `ids` (one readable id per sample)
-- set `n_channels` if it is not 1 — `train.py` sizes `model.params.in_channels` from it
-- override `prefetch(batch)` if the backend is cheaper to read a batch at a time
+- `n_channels`, `n_classes` — `train.py` sizes the model's `in_channels` and `num_classes` from them
+- `split(name, fold)` for `name` in train, valid, test — a torch `Dataset` per loader
 
-`train.py` derives `in_channels` and `n_classes` from the dataset. Labels must be exactly `0..n_classes-1`; anything else is rejected at startup.
+Each split's `__getitem__` receives what `SeededBatchSampler` (`base.py`) yields, `(epoch, indices)`,
+and returns `{index: {"input": [C,H,W] float, "label": [H,W] long, "index": index}}`;
+`collate_volumes` stacks that into `(inputs [B,C,H,W], masks [B,H,W], indices [B])`.
+Inputs go to the model as they are: no normalisation.
 
-## dummy.py
+## hsi.py
 
-Random volumes generated for tests. 
-- `signal` controls class contrast: the blob's amplitude in noise SDs, no upper bound.
-- `channels` and `n_classes` make it stand in for a wider or multiclass dataset.
-conf/config.yaml is a worked example that runs on dummy data.
-## mongo.py
+Synthetic scenes from `src/data_generation`, generated in the loader workers (~2 ms each on CPU).
+A scene is fixed by its seed:
 
-A MindfulTensors MongoDB: chunked volumes from `<collection>.bin` keyed by `(id, kind)`,
-the label and the per-subject `modalities` list from `<collection>.meta`. Listing several
-`modalities` stacks them as channels, in the order given, and keeps only subjects carrying
-all of them.
+| split | seed | changes with |
+|---|---|---|
+| train | `scene_seed(seed_train, fold, epoch, index)` | every epoch and fold |
+| valid | `scene_seed(seed_valid, index)` | nothing: the same set every epoch, fold and rerun |
+| test | `scene_seed(seed_test, index)` | nothing |
 
-`conf/mongo_fbirn.yaml` is a worked example.
-
-## mdd.py
-
-MDD DIRECT based on joining two csvs: `mdd_master.csv` and `mdd_direct_volume_paths.csv`. Selection runs in four stages, each
-counted in the `[MDD]` line: `filters` (csv flags that must read True), `ranges` (numeric
-columns inside an inclusive `[min, max]`, or equal to a single value), `require` (columns
-that must hold a number), and `to_class`, which allows to group multiclass labels into bins.
-
-`modalities` degermine channels. `normalize` decides
-what gets rescaled: `falff` (the fALFF channels only — probsegs are already 0-1),
-`per_channel`, `volume` (once after stacking), or `none`.
-
-`conf/mdd_direct.yaml` is a worked example.
+`n_train` is the number of scenes per epoch, `n_valid` and `n_test` the fixed set sizes.
+`scene` picks the scene type (`random` draws from the generator's satellite/shapes/patches mix).
+`sim` holds every `SimConfig` field, so `config.yaml` records the full generator setting;
+override one with e.g. `+data.params.sim.sensor_noise_std=0.05`.

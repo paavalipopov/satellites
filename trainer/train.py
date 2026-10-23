@@ -18,7 +18,6 @@ from catalyst.data import BatchPrefetchLoaderWrapper
 from catalyst.utils import get_optimizer_momentum, load_checkpoint
 from omegaconf import DictConfig, OmegaConf
 from scipy import stats
-from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
@@ -28,17 +27,23 @@ from src.utils import (
     ModelCheckpoint,
     clear_rundir,
     plot_curves,
+    segmentation_metrics,
     setup_distributed_port,
     tee_stdout,
     world_size_from_env,
 )
+
+METRICS = {"loss", "accuracy", "miou", "macro_f1", "fg_accuracy", "fg_f1"}  # loader metrics #TODO: I don't like having this variable, but I am not sure how to deal with it best. where the user can find what metrics are available, if the look at segmentation_metrics? 
 
 setup_distributed_port()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 class CustomRunner(dl.Runner):
-    """Classification trainer, one CV fold per runner.
+    """Per-pixel material classifier trainer, one fold per runner.
+
+    A fold is one training run: its own stream of fresh training scenes, the same valid
+    and test sets as every other fold.
     """
 
     def __init__(self, logdir: str, dataset, cfg):
@@ -47,20 +52,11 @@ class CustomRunner(dl.Runner):
         self._moredir = os.path.join(logdir, "more")  # detail logs, out of the main view
         os.makedirs(self._moredir, exist_ok=True)
         self.dataset = dataset
-        self.labels = np.asarray(dataset.labels)
         self.cfg = cfg
         # what catalyst writes to hparams.json and hands to wandb's run config
         self._hparams = OmegaConf.to_container(cfg, resolve=True)
 
-        # _pred_columns controls the raw prediction logs, whose columns
-        # vary with the number of classes
-        self.n_classes = cfg.model.params.n_classes
-        self._pred_columns = (
-            ["epoch", "rank", "index"]
-            + [f"logit_{k}" for k in range(self.n_classes)]
-            + [f"prob_{k}" for k in range(self.n_classes)]
-            + ["target"]
-        )
+        self.n_classes = cfg.runtime.n_classes
 
         self._started = time.time()
         self._split_sizes = {}
@@ -126,53 +122,21 @@ class CustomRunner(dl.Runner):
 
     def get_loaders(self):
         experiment, runtime = self.cfg.experiment, self.cfg.runtime
-        # stratified CV split of the dataset, then a stratified valid slice off the train part
-        cv = StratifiedKFold(
-            n_splits=experiment.cv_folds, shuffle=True, random_state=experiment.cv_seed
-        )
-        train_idx, test_idx = list(cv.split(np.arange(len(self.labels)), self.labels))[
-            runtime.fold_idx
-        ]
-        train_idx, valid_idx = train_test_split(
-            train_idx,
-            test_size=experiment.valid_ratio,
-            stratify=self.labels[train_idx],
-            random_state=experiment.train_val_seed,
-        )
-        splits = {"train": train_idx, "valid": valid_idx, "test": test_idx}
-        self._split_sizes = {name: len(idx) for name, idx in splits.items()}
+        # fresh train scenes per epoch and fold; valid and test fixed by their seeds
+        splits = {
+            key: self.dataset.split(key, fold=runtime.fold_idx) for key in ("train", "valid", "test") # TODO fold_idx, "fold" again. please rename
+        }
+        self._split_sizes = {name: len(split) for name, split in splits.items()}
         print(
             f"[Fold {runtime.fold_idx}] "
             + " ".join(f"{k}={v}" for k, v in self._split_sizes.items())
         )
 
         if self.engine.is_main_process:
-            # save the split, as dataset indices and as ids
-            payload = {
-                "fold_idx": runtime.fold_idx,
-                "cv_folds": experiment.cv_folds,
-                "cv_seed": experiment.cv_seed,
-                "train_val_seed": experiment.train_val_seed,
-            }
-            for name, indices in splits.items():
-                payload[name] = {
-                    "indices": [int(i) for i in indices],
-                    "labels": [int(self.labels[int(i)]) for i in indices],
-                }
-                with open(os.path.join(self._moredir, f"{name}_ids.txt"), "w") as handle:
-                    handle.writelines(f"{self.dataset.ids[int(i)]}\n" for i in indices)
-            with open(os.path.join(self._logdir, "split_indices.json"), "w") as handle:
-                json.dump(payload, handle, indent=4)
-
             # everything needed to reproduce this fold, seeds included
             fold_cfg = {
                 "fold_idx": runtime.fold_idx,
-                "seeds": {
-                    "cv_seed": experiment.cv_seed,
-                    "train_val_seed": experiment.train_val_seed,
-                    "sampler_seed": experiment.sampler_seed,
-                    "model_init_seed": self.cfg.model.init_seed,
-                },
+                "seeds": self._seeds(),
                 "world_size": self.engine.num_processes,
                 "max_lr": runtime.max_lr,
                 "batch_size_per_rank": experiment.batch_size,
@@ -184,10 +148,9 @@ class CustomRunner(dl.Runner):
                 yaml.safe_dump(fold_cfg, handle, indent=4, sort_keys=False)
 
         loaders = {}
-        for key, indices in (("train", train_idx), ("valid", valid_idx), ("test", test_idx)):
+        for key, subset in splits.items():
             loader_opts = self.cfg.loader["train" if key == "train" else "eval"]
             num_workers = loader_opts.num_workers
-            subset = self.dataset.subset(indices)
             # Plain sampler with the same seed on every rank. accelerate's
             # engine.prepare() already shards the DataLoader, so pre-sharding here would
             # shard twice and drop ~(1 - 1/world_size) of the data each epoch.
@@ -212,6 +175,16 @@ class CustomRunner(dl.Runner):
             )
         return loaders
 
+    def _seeds(self):
+        data = self.cfg.data.params
+        return {
+            "seed_train": data.seed_train,
+            "seed_valid": data.seed_valid,
+            "seed_test": data.seed_test,
+            "sampler_seed": self.cfg.experiment.sampler_seed,
+            "model_init_seed": self.cfg.model.init_seed,
+        }
+
     def get_model(self):
         # fixed init, with the global RNG stream restored so it is not perturbed
         if self.cfg.model.init_seed is not None:
@@ -222,7 +195,7 @@ class CustomRunner(dl.Runner):
         if self.cfg.experiment.paths.init_weights:  # start from saved weights (not a resume)
             model.load_state_dict(load_checkpoint(self.cfg.experiment.paths.init_weights))
         if self.cfg.experiment.channels_last:  # before DDP wraps it
-            model = model.to(memory_format=torch.channels_last_3d)
+            model = model.to(memory_format=torch.channels_last)
         if self.cfg.experiment.compile:  # in place, keeps state_dict keys
             model.compile()
 
@@ -263,32 +236,25 @@ class CustomRunner(dl.Runner):
     def on_loader_start(self, runner):
         super().on_loader_start(runner)
 
-        # initialize metrics
-        self.meters = {
-            "loss": metrics.AdditiveMetric(),
-            "accuracy": metrics.AdditiveMetric(),
-            "auc": metrics.AUCMetric(),
-        }
-
-        # per-sample predictions logs: rawest logs possible, useful for recovering arbitrary metrics
-        raw_preds_path = os.path.join(
-            self._moredir, f"raw_preds_{self.loader_key}_rank{self.engine.process_index}.csv"
-        )
-        needs_header = not os.path.isfile(raw_preds_path) or os.path.getsize(raw_preds_path) == 0
-        self.raw_preds_file = open(raw_preds_path, "a", newline="")
-        self.raw_preds_writer = csv.writer(self.raw_preds_file)
-        if needs_header:
-            self.raw_preds_writer.writerow(self._pred_columns)
+        # initialize metrics; the pixel metrics all come from the confusion counts
+        self.meters = {"loss": metrics.AdditiveMetric()}
+        self.confusion = torch.zeros(
+            self.n_classes, self.n_classes, dtype=torch.long, device=self.engine.device
+        ) #TODO I guess defining self.confusion and self.test_preds this way will work, but can it be done a bit more elegantly? can we wrap our metrics into catalyst meter classes? we can put them into utils for better organization. will it save us any code/clarity?
+        self.test_preds = []  # (index, predicted mask, target mask) per batch, test only # TODO is it ok to create it for every dataloader, even tain val?
 
     def on_loader_end(self, runner):
         # compute the loader's metrics
         self.loader_metrics["loss"] = self.meters["loss"].compute()[0]
-        self.loader_metrics["accuracy"] = self.meters["accuracy"].compute()[0]
-        # compute() gives per_class, micro, macro, weighted
-        _, _, macro, weighted = self.meters["auc"].compute()
-        self.loader_metrics["auc"], self.loader_metrics["auc_weighted"] = macro, weighted
+        # summed over ranks first, so the metrics see every pixel
+        confusion = self.engine.reduce(self.confusion, reduction="sum").cpu()
+        self.loader_metrics.update(segmentation_metrics(confusion))
 
-        self.raw_preds_file.close()
+        # predicted masks, merged across ranks in on_experiment_end
+        if self.loader_key == "test":
+            index, pred, target = (torch.cat(column).numpy() for column in zip(*self.test_preds))
+            path = os.path.join(self._moredir, f"test_preds_rank{self.engine.process_index}.npz")
+            np.savez_compressed(path, index=index, pred=pred, target=target)
         super().on_loader_end(runner)
 
     def on_epoch_end(self, runner):
@@ -304,7 +270,7 @@ class CustomRunner(dl.Runner):
         self.engine.unwrap_model(self.model).load_state_dict(load_checkpoint(checkpoint.path(main)))
 
         # prepare for test
-        # epoch_step stamps the raw_preds rows, so point it at the epoch these
+        # epoch_step stamps the test logs, so point it at the epoch these
         # weights come from, then put the true epoch count back for epochs_run
         epoch_buffer, self.epoch_step = self.epoch_step, best["epoch"]
         self.loader_key, self.loader = "test", self.test_loader
@@ -315,7 +281,7 @@ class CustomRunner(dl.Runner):
         self._run_event("on_loader_end")
 
         # save logs and restore things
-        self.engine.wait_for_everyone()  # every rank has closed its raw_preds file
+        self.engine.wait_for_everyone()  # every rank has saved its test predictions
         self.epoch_step = epoch_buffer
         best["metrics"]["test"] = {
             k: float(v) for k, v in sorted(self.loader_metrics.items())
@@ -323,15 +289,14 @@ class CustomRunner(dl.Runner):
 
         # final logging and cleanup
         if self.engine.is_main_process:
-            # combine raw test predictions into a clear file.
-            preds = {}
-            for path in sorted(glob.glob(os.path.join(self._moredir, "raw_preds_test_rank*.csv"))):
-                with open(path) as handle:
-                    preds.update({int(row["index"]): row for row in csv.DictReader(handle)})
-            with open(os.path.join(self._logdir, "test_predictions.csv"), "w", newline="") as h:
-                writer = csv.DictWriter(h, fieldnames=self._pred_columns)
-                writer.writeheader()
-                writer.writerows(preds[i] for i in sorted(preds))
+            # combine the ranks' test predictions into one file, one row per test scene
+            parts = [np.load(path) for path in
+                     sorted(glob.glob(os.path.join(self._moredir, "test_preds_rank*.npz")))]
+            preds = {key: np.concatenate([part[key] for part in parts])
+                     for key in ("index", "pred", "target")}
+            _, keep = np.unique(preds["index"], return_index=True)  # DDP pads with repeats
+            np.savez_compressed(os.path.join(self._logdir, "test_predictions.npz"),
+                                epoch=best["epoch"], **{k: v[keep] for k, v in preds.items()})
 
             # save fold summary
             summary = {
@@ -342,12 +307,7 @@ class CustomRunner(dl.Runner):
                 "split_sizes": self._split_sizes,
                 "metrics": best["metrics"],
                 "bests": checkpoint.best,  # every selection; test scores only with test_every_epoch
-                "seeds": {
-                    "cv_seed": self.cfg.experiment.cv_seed,
-                    "train_val_seed": self.cfg.experiment.train_val_seed,
-                    "sampler_seed": self.cfg.experiment.sampler_seed,
-                    "model_init_seed": self.cfg.model.init_seed,
-                },
+                "seeds": self._seeds(),
                 "world_size": self.engine.num_processes,
                 "batch_size_per_rank": self.cfg.experiment.batch_size,
                 "max_lr": self.cfg.runtime.max_lr,
@@ -365,9 +325,9 @@ class CustomRunner(dl.Runner):
         super().on_experiment_end(runner)
 
     def handle_batch(self, batch):
-        sample, target, index = batch   # target is [B] class indices, index is the dataset row
+        sample, target, index = batch   # target is [B,H,W] masks, index is the row in its split # TODO what is index? I didn't get you explanation
         if self.cfg.experiment.channels_last:
-            sample = sample.contiguous(memory_format=torch.channels_last_3d)
+            sample = sample.contiguous(memory_format=torch.channels_last)
         autocast = torch.autocast(
             self.engine.device.type, dtype=torch.bfloat16, enabled=self.cfg.experiment.bf16
         )
@@ -387,27 +347,18 @@ class CustomRunner(dl.Runner):
         y_hat = y_hat.float()  # bf16 logits would coarsen metrics and preds
 
         with torch.no_grad():
-            probs = torch.softmax(y_hat, dim=1)
-            accuracy = (probs.argmax(1) == target).float().mean()
-            # AUCMetric scores every class, so it needs one-hot targets
-            auc_target = torch.nn.functional.one_hot(target, self.n_classes)
-            # Write raw predictions for every sample in the batch, so arbitrary
-            # metrics can be computed later.
-            self.raw_preds_writer.writerows(
-                [self.epoch_step, self.engine.process_index, row, *logits, *scores, label]
-                for row, logits, scores, label in zip(
-                    index.cpu().numpy().tolist(),
-                    y_hat.detach().float().cpu().numpy().tolist(),
-                    probs.float().cpu().numpy().tolist(),
-                    target.cpu().numpy().tolist(),
-                )
-            )
+            pred = y_hat.argmax(1)
+            accuracy = (pred == target).float().mean()
+            # pixel confusion counts, rows target, columns prediction
+            self.confusion += torch.bincount(
+                (target * self.n_classes + pred).flatten(), minlength=self.n_classes**2
+            ).view(self.n_classes, self.n_classes)
+            if self.loader_key == "test":
+                self.test_preds.append((index.cpu(), pred.byte().cpu(), target.byte().cpu()))
 
         # batch_metrics feeds the tqdm bar; the loader values are saved in the meters
         self.batch_metrics.update({"loss": loss, "accuracy": accuracy})
         self.meters["loss"].update(loss.item(), self.batch_size)
-        self.meters["accuracy"].update(accuracy.item(), self.batch_size)
-        self.meters["auc"].update(probs, auc_target)
 
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)
@@ -427,11 +378,9 @@ def main(cfg: DictConfig):
     )
     for ok, message in (
         (experiment.epochs >= 1, "epochs must be at least 1"),
-        (experiment.cv_folds >= 2, "cv_folds must be at least 2"),
-        (0 < experiment.valid_ratio < 1, "valid_ratio must be between 0 and 1"),
-        (len(experiment.selection) > 0
-         and set(experiment.selection) <= {"loss", "accuracy", "auc", "auc_weighted"},
-         "selection: a list of loss, accuracy, auc, auc_weighted"),
+        (experiment.cv_folds >= 1, "cv_folds must be at least 1"),
+        (len(experiment.selection) > 0 and set(experiment.selection) <= METRICS, # TODO METRICS again, we can keep it as is, but a wquestion to you, how (where) can we add more metrics, in utils function? maybe keep metrics there?
+         f"selection: a list of {', '.join(sorted(METRICS))}"),
         (target_folds and all(0 <= i < experiment.cv_folds for i in target_folds),
          f"target_folds must be a non-empty subset of 0..{experiment.cv_folds - 1}"),
     ):
@@ -441,17 +390,14 @@ def main(cfg: DictConfig):
     # ===== Data setup =====
     # build dataset and get data params from it
     dataset = build_dataset(cfg)
-    classes, counts = np.unique(dataset.labels, return_counts=True)
     cfg.runtime.n_channels = int(dataset.n_channels)
-    cfg.runtime.n_classes = len(classes)
+    cfg.runtime.n_classes = int(dataset.n_classes)
+    data = cfg.data.params
     print(
-        f"[Data] {cfg.data.name}: {len(dataset)} samples, {cfg.runtime.n_channels} channel(s), "
-        f"class counts: {dict(zip(classes.tolist(), counts.tolist()))}"
+        f"[Data] {cfg.data.name}: {data.n_train} fresh train scenes per epoch, "
+        f"valid {data.n_valid}, test {data.n_test}, {cfg.runtime.n_channels} channel(s), "
+        f"{cfg.runtime.n_classes} classes"
     )
-
-    # check that labels are 0..n_classes-1; CrossEntropy breaks if they are not
-    if classes.tolist() != list(range(cfg.runtime.n_classes)):
-        raise ValueError(f"{cfg.data.name} labels are {classes.tolist()}, not 0..K-1")
 
     resolve_params("model", cfg)
 
@@ -481,8 +427,8 @@ def main(cfg: DictConfig):
         print(f"[Resume] on; folds already complete: {done}")
 
         # a resumed fold keeps the old schedule, splits and optimizer state
-        for key in ("experiment.epochs", "experiment.batch_size", "experiment.cv_folds",
-                    "experiment.cv_seed", "experiment.train_val_seed",
+        for key in ("experiment.epochs", "experiment.batch_size", "data.params.n_train",
+                    "data.params.seed_train", "data.params.seed_valid", "data.params.seed_test",
                     "experiment.sampler_seed", "runtime.world_size"):
             was = OmegaConf.select(OmegaConf.load(config_path), key)
             if was is not None and was != OmegaConf.select(cfg, key):

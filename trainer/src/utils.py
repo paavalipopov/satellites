@@ -68,7 +68,7 @@ def clear_rundir(rundir):
     if not os.path.isdir(rundir):
         return
     backup = os.path.join(rundir, time.strftime("backup_%Y%m%d_%H%M%S"))
-    artefacts = (".csv", ".json", ".jsonl", ".txt", ".yaml", ".pth")
+    artefacts = (".csv", ".json", ".jsonl", ".txt", ".yaml", ".pth", ".npz")
     moved = 0
     for root, dirs, names in os.walk(rundir):
         dirs[:] = [d for d in dirs if not d.startswith("backup_")]  # keep older backups
@@ -139,11 +139,33 @@ class ModelCheckpoint(dl.ICheckpointCallback):
             self._save(runner, state, os.path.join(self.logdir, "state.last.pth"))
 
 
+def segmentation_metrics(confusion):
+    """Pixel metrics from a ``[K, K]`` confusion matrix (rows target, columns prediction).
+
+    Class 0 is background. ``miou`` and ``macro_f1`` average over the classes present in
+    the target or the prediction; ``fg_*`` treat every material as one foreground class.
+    """
+    confusion = confusion.double()
+    tp = confusion.diag()
+    fp, fn = confusion.sum(0) - tp, confusion.sum(1) - tp
+    seen = (tp + fp + fn) > 0
+
+    # foreground: is it a material at all, and which one
+    fg_tp, fg_fp, fg_fn = confusion[1:, 1:].sum(), confusion[0, 1:].sum(), confusion[1:, 0].sum()
+    fg_pixels = confusion[1:].sum().clamp_min(1)
+    return {
+        "accuracy": float(tp.sum() / confusion.sum().clamp_min(1)),
+        "miou": float((tp / (tp + fp + fn).clamp_min(1))[seen].mean()),
+        "macro_f1": float((2 * tp / (2 * tp + fp + fn).clamp_min(1))[seen].mean()),
+        "fg_accuracy": float(tp[1:].sum() / fg_pixels),
+        "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
+    }
+
+
 def run_info(summaries, cfg):
     """Plain-text description of one or more folds, for the info panel of curves.png."""
     params, first = cfg["data"]["params"], summaries[0]
-    shown = ("modalities", "label_column", "label_field", "classes", "filters", "ranges",
-             "n_samples", "shape", "signal")
+    shown = ("n_train", "n_valid", "n_test", "scene")
     lines = [
         f"experiment  {cfg['experiment']['name']}",
         f"folds       {', '.join(str(s['fold_idx']) for s in summaries)} "
@@ -162,7 +184,7 @@ def run_info(summaries, cfg):
 
     # metrics at each fold's best epoch, mean±sd over folds
     for name in ("train", "valid", "test"):
-        keys = sorted(k for k in first["metrics"].get(name, {}) if k != "auc_weighted")
+        keys = sorted(first["metrics"].get(name, {}))
         values = {k: [s["metrics"][name][k] for s in summaries] for k in keys}
         if values:
             lines.append(f"{name + ' @best':<11} " + "  ".join(
@@ -203,28 +225,27 @@ def plot_curves(rundirs, cfg, path):
             best, test = summaries[-1]["best_epoch"], summaries[-1]["metrics"].get("test", {})
             hide = "_" if i else ""  # "_" labels stay out of the legend
 
-            # lr; train vs valid: loss, auc (solid), accuracy (dashed)
+            # lr; train vs valid: loss, miou (solid), accuracy (dashed)
             lr_ax.plot(logs["_epoch_"]["step"], logs["_epoch_"]["lr"], color="k", alpha=alpha)
             for name, color in (("train", "C0"), ("valid", "C1"), ("test", "C2")):
                 if name not in logs:
                     continue
                 log = logs[name]
                 loss_ax.plot(log["step"], log["loss"], color=color, alpha=alpha, label=hide + name)
-                metric_ax.plot(log["step"], log["auc"], color=color, alpha=alpha,
-                               label=f"{hide}{name} auc")
+                metric_ax.plot(log["step"], log["miou"], color=color, alpha=alpha,
+                               label=f"{hide}{name} miou")
                 metric_ax.plot(log["step"], log["accuracy"], color=color, alpha=alpha, ls="--",
                                label=f"{hide}{name} accuracy")
 
             # best epoch: dots on lr and valid loss, test scores
             for ax, log, key in ((lr_ax, logs["_epoch_"], "lr"), (loss_ax, logs["valid"], "loss")):
                 ax.plot(best, np.interp(best, log["step"], log[key]), "o", mfc="w", mec="k", ms=5)
-            metric_ax.plot(best, test.get("auc", np.nan), "k*", ms=9, label=f"{hide}test auc")
+            metric_ax.plot(best, test.get("miou", np.nan), "k*", ms=9, label=f"{hide}test miou")
             metric_ax.plot(best, test.get("accuracy", np.nan), "kx", ms=7,
                            label=f"{hide}test accuracy")
 
         lr_ax.set(title="learning rate (end of epoch)", xlabel="epoch")
-        metric_ax.axhline(0.5, color="grey", lw=0.8, ls=":")
-        metric_ax.set(title="AUC and accuracy", xlabel="epoch")
+        metric_ax.set(title="mIoU and accuracy", xlabel="epoch")
         metric_ax.legend(fontsize=8, ncol=3)
 
         # log-scale loss, ticks 1-2-5 as plain numbers
