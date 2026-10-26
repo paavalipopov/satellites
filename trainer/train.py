@@ -119,12 +119,10 @@ class CustomRunner(dl.Runner):
             return
 
         # === Resume routines ===
-        # reopen CSVLoggers manually to avoid writing headers again
-        if "csv" in self.loggers:  # only the main process has loggers
-            for key in [*self.loaders, "_epoch_"]:
-                path = os.path.join(self._logdir, f"{key}.csv")
-                if os.path.isfile(path):
-                    self.loggers["csv"].loggers[key] = open(path, "a")
+        # reopen the CSVLogger's file manually to avoid writing its header again
+        path = os.path.join(self._logdir, "_epoch_.csv")
+        if "csv" in self.loggers and os.path.isfile(path):  # only the main process has loggers
+            self.loggers["csv"].loggers["_epoch_"] = open(path, "a")
 
     def get_loaders(self):
         experiment, runtime = self.cfg.experiment, self.cfg.runtime
@@ -271,8 +269,12 @@ class CustomRunner(dl.Runner):
         super().on_loader_end(runner)
 
     def on_epoch_end(self, runner):
-        self.epoch_metrics["_epoch_"]["lr"] = self.optimizer.param_groups[0]["lr"]
-        self.epoch_metrics["_epoch_"]["momentum"] = get_optimizer_momentum(self.optimizer)
+        # write epoch logs to _epoch_.csv: lr, momentum and every loader's metrics
+        row = self.epoch_metrics["_epoch_"]
+        row["lr"] = self.optimizer.param_groups[0]["lr"]
+        row["momentum"] = get_optimizer_momentum(self.optimizer)
+        for key in self.loaders:
+            row.update({f"{key}_{k}": v for k, v in self.epoch_metrics.pop(key).items()})
         super().on_epoch_end(runner)
 
     def on_experiment_end(self, runner):
@@ -383,8 +385,6 @@ def main(cfg: DictConfig):
     experiment = cfg.experiment
     run_idx = experiment.run_idx
     run_ids = list(run_idx) if OmegaConf.is_list(run_idx) else [run_idx]
-    if cfg.stream_log:  # one log per job, so parallel jobs don't interleave
-        tee_stdout(os.path.join(logdir, "stdout_run" + "_".join(map(str, run_ids)) + ".log"))
 
     # validate config
     for ok, message in (
@@ -461,7 +461,7 @@ def main(cfg: DictConfig):
             print(f"[Resume] run {run_idx} ({position}/{len(run_ids)}) done, skipping")
             continue
         print(f"Starting run {run_idx} ({position}/{len(run_ids)})")
-        os.makedirs(rundir, exist_ok=True)
+        os.makedirs(os.path.join(rundir, "more"), exist_ok=True)
 
         # pick an interrupted run up where it stopped, or start it fresh
         state = os.path.join(rundir, "state.last.pth")
@@ -470,12 +470,15 @@ def main(cfg: DictConfig):
             print(f"[Resume] continuing run {run_idx} from state.last.pth")
         else:  # drop what an earlier run left here
             clear_rundir(rundir)
+        if cfg.stream_log:  # this run's own stdout, beside its detail logs
+            tee_stdout(os.path.join(rundir, "more", "run.log"))
 
         # TRAIN THE RUN
         cfg.runtime.run_idx = run_idx
         cfg.runtime.resume_runner = resume_runner
         runner = CustomRunner(logdir=rundir, dataset=dataset, cfg=cfg)
         runner.run()
+        tee_stdout()  # back to the console only
 
         # GC step; the run is done, so its resume state can go
         del runner

@@ -60,13 +60,8 @@ src/data_generation/      the scene generator, copied from the project's src/
 | `loader` | `num_workers`, `prefetch_factor`, `persistent_workers`, `prefetches` for `train` and `eval` |
 | `wandb` | `project` / `entity` / `name`; off unless you uncomment the logger |
 | `runtime` | filled in by `train.py` at startup — run index, world size, the scaled lr, the resume checkpoint, and the dataset's channel and class counts. Not for hand editing; it is there so the logged config says what ran |
-| `stream_log` | config for stdout logger that fills `stdout_run<i>.log` |
+| `stream_log` | config for stdout logger that fills each run's `more/run.log` |
 
-`experiment.name` is the log folder name *and* the wandb run name, so a run is easy to
-trace in either direction. `experiment.selection` lists the valid metrics that each pick a
-best epoch (lowest loss, highest of the others). The first one picks the checkpoint that is
-tested and reported; the others only save their weights (`model.best_<metric>.pth`) and best
-epoch. `experiment.selection=[miou,loss]` makes the highest valid mIoU the tested model.
 
 ## Logs
 
@@ -77,16 +72,13 @@ Everything lands under `logs/<experiment.name>/`.
 | `runs.csv` | one row per finished run: split sizes, best epoch, valid and **test** metrics (`test_*`, `test_satellite_*`), seeds, wall time |
 | `summary.json` | mean, std, median and a 95% t interval across runs |
 | `config.yaml` | the resolved config of the latest job |
-| `stdout_run<i>[_<j>...].log` | everything a job printed, including from spawned DDP ranks, named by its runs |
 | `curves.png` | every run's training curves in one figure, one line per run |
 
 And per run, in `run_<i>/`:
 
 | file | what |
 |---|---|
-| `train.csv` `valid.csv` | per-epoch `loss` and the pixel metrics |
-| `test.csv` `test_satellite.csv` | the same per test loader, with `experiment.test_every_epoch=true` |
-| `_epoch_.csv` | per-epoch `lr` and `momentum` |
+| `_epoch_.csv` | one row per epoch: `lr`, `momentum` and each loader's `loss` and pixel metrics (`train_loss`, `valid_miou`, ...; `test*_` with `experiment.test_every_epoch=true`) |
 | `run_summary.json` | best epoch, best metrics, seeds, wall time |
 | `<test>_predictions.npz` | per test loader: `index`, `kind` (0 satellite, 1 shapes, 2 patches), predicted and target masks of every scene, and the `epoch` of the weights |
 | `curves.png` | per-epoch LR, loss, mIoU and accuracy, with the run's info |
@@ -100,6 +92,7 @@ and the detail, in `run_<i>/more/`:
 |---|---|
 | `run_config.yaml` | the config plus every seed, enough to reproduce this run |
 | `<test>_preds_rank<r>.npz` | each rank's part of `<test>_predictions.npz` |
+| `run.log` | everything the run printed, including from spawned DDP ranks |
 
 Rerunning a run clears its directory first — nothing is deleted, the
 old artefacts move to `backup_<timestamp>/`. With `experiment.resume=true` it instead continues from an interrupted run, or restarts it if `experiment.save_state=false`.

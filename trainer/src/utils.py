@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from catalyst import dl
 
-_TEE_PROCESS = None  # kept alive for the life of the run
+_TEE = {}  # the real stdout and the running tee, kept for the life of the run
 
 
 def setup_distributed_port(low=2000, high=2200):
@@ -45,16 +45,23 @@ def world_size_from_env():
     return int(os.environ.get("SLURM_GPUS_ON_NODE", torch.cuda.device_count()))
 
 
-def tee_stdout(path):
+def tee_stdout(path=None):
     """Duplicate stdout into ``path`` at the fd level, so spawned DDP ranks land in it too.
 
-    tqdm writes to stderr and is deliberately left out, which keeps the file readable.
+    Each call ends the previous copy first, and ``path=None`` only ends it. tqdm writes to
+    stderr and is deliberately left out, which keeps the file readable.
     """
-    global _TEE_PROCESS
     sys.stdout.flush()
+    if "tee" in _TEE:  # back to the real stdout; the old tee drains and exits
+        os.dup2(_TEE["stdout"], sys.stdout.fileno())
+        _TEE.pop("tee").stdin.close()
+    if path is None:
+        return
     try:
-        _TEE_PROCESS = subprocess.Popen(["tee", "-a", path], stdin=subprocess.PIPE)
-        os.dup2(_TEE_PROCESS.stdin.fileno(), sys.stdout.fileno())
+        if "stdout" not in _TEE:  # the real stdout, to come back to
+            _TEE["stdout"] = os.dup(sys.stdout.fileno())
+        _TEE["tee"] = subprocess.Popen(["tee", "-a", path], stdin=subprocess.PIPE)
+        os.dup2(_TEE["tee"].stdin.fileno(), sys.stdout.fileno())
         sys.stdout.reconfigure(line_buffering=True)
     except (OSError, ValueError) as error:
         print(f"[Log] could not tee stdout into {path}: {error}")
@@ -62,14 +69,11 @@ def tee_stdout(path):
 
 def clear_rundir(rundir):
     """Move an earlier run's artefacts into ``backup_<timestamp>/``.
-
-    Catalyst's CSVLogger opens its files "a+", so a rerun of the same experiment name
-    would otherwise interleave two runs in one csv.
     """
     if not os.path.isdir(rundir):
         return
     backup = os.path.join(rundir, time.strftime("backup_%Y%m%d_%H%M%S"))
-    artefacts = (".csv", ".json", ".jsonl", ".txt", ".yaml", ".pth", ".npz")
+    artefacts = (".csv", ".json", ".jsonl", ".log", ".txt", ".yaml", ".pth", ".npz")
     moved = 0
     for root, dirs, names in os.walk(rundir):
         dirs[:] = [d for d in dirs if not d.startswith("backup_")]  # keep older backups
@@ -238,7 +242,7 @@ def run_info(summaries, cfg):
 def plot_curves(rundirs, cfg, path):
     """Save the training curves of one or more runs as ``path``, one line per run.
 
-    Reads each run's csv logs and run_summary.json, so it works on finished runs too.
+    Reads each run's _epoch_.csv and run_summary.json, so it works on finished runs too.
     Never raises: a plotting problem must not cost a finished run.
     """
     try:
@@ -251,37 +255,32 @@ def plot_curves(rundirs, cfg, path):
         alpha = 1 if len(rundirs) == 1 else 0.5
         summaries = []
         for i, rundir in enumerate(rundirs):
-            # the run's summary, and per-epoch logs as {column: array}
+            # the run's summary, and the per-epoch log as {column: array}
             with open(os.path.join(rundir, "run_summary.json")) as handle:
                 summaries.append(json.load(handle))
             best, metrics = summaries[-1]["best_epoch"], summaries[-1]["metrics"]
             tests = [name for name in metrics if name.startswith("test")]
-            logs = {}
-            for name in ("train", "valid", *tests, "_epoch_"):
-                log_path = os.path.join(rundir, f"{name}.csv")
-                if not os.path.isfile(log_path):  # test*.csv exist only with test_every_epoch
-                    continue
-                with open(log_path) as handle:
-                    rows = list(csv.DictReader(handle))
-                logs[name] = {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
+            with open(os.path.join(rundir, "_epoch_.csv")) as handle:
+                rows = list(csv.DictReader(handle))
+            log = {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
             hide = "_" if i else ""  # "_" labels stay out of the legend
             colors = {name: f"C{j}" for j, name in enumerate(("train", "valid", *tests))}
 
             # lr; train vs valid: loss, miou (solid), accuracy (dashed)
-            lr_ax.plot(logs["_epoch_"]["step"], logs["_epoch_"]["lr"], color="k", alpha=alpha)
+            epoch = log["step"]
+            lr_ax.plot(epoch, log["lr"], color="k", alpha=alpha)
             for name, color in colors.items():
-                if name not in logs:
+                if f"{name}_loss" not in log:  # tests are logged only with test_every_epoch
                     continue
-                log = logs[name]
-                loss_ax.plot(log["step"], log["loss"], color=color, alpha=alpha, label=hide + name)
-                metric_ax.plot(log["step"], log["miou"], color=color, alpha=alpha,
+                loss_ax.plot(epoch, log[f"{name}_loss"], color=color, alpha=alpha, label=hide + name)
+                metric_ax.plot(epoch, log[f"{name}_miou"], color=color, alpha=alpha,
                                label=f"{hide}{name} miou")
-                metric_ax.plot(log["step"], log["accuracy"], color=color, alpha=alpha, ls="--",
+                metric_ax.plot(epoch, log[f"{name}_accuracy"], color=color, alpha=alpha, ls="--",
                                label=f"{hide}{name} accuracy")
 
             # best epoch: dots on lr and valid loss, each test's scores
-            for ax, log, key in ((lr_ax, logs["_epoch_"], "lr"), (loss_ax, logs["valid"], "loss")):
-                ax.plot(best, np.interp(best, log["step"], log[key]), "o", mfc="w", mec="k", ms=5)
+            for ax, key in ((lr_ax, "lr"), (loss_ax, "valid_loss")):
+                ax.plot(best, np.interp(best, epoch, log[key]), "o", mfc="w", mec="k", ms=5)
             for name in tests:
                 metric_ax.plot(best, metrics[name].get("miou", np.nan), "*", color=colors[name],
                                mec="k", ms=10, label=f"{hide}{name} miou")
