@@ -69,7 +69,7 @@ Everything lands under `logs/<experiment.name>/`.
 
 | file | what |
 |---|---|
-| `runs.csv` | one row per finished run: split sizes, best epoch, valid and **test** metrics (`test_*`, `test_satellite_*`), seeds, wall time |
+| `runs.csv` | one row per finished run: split sizes, best epoch, valid and **test** metrics (`test_*`, `test_satellite_*`), no-skill `baseline_*`, seeds, wall time |
 | `summary.json` | mean, std, median and a 95% t interval across runs |
 | `config.yaml` | the resolved config of the latest job |
 | `curves.png` | every run's training curves in one figure, one line per run |
@@ -79,7 +79,7 @@ And per run, in `run_<i>/`:
 | file | what |
 |---|---|
 | `_epoch_.csv` | one row per epoch: `lr`, `momentum` and each loader's `loss` and pixel metrics (`train_loss`, `valid_miou`, ...; `test*_` with `experiment.test_every_epoch=true`) |
-| `run_summary.json` | best epoch, best metrics, seeds, wall time |
+| `run_summary.json` | best epoch, best metrics, no-skill baseline per test set, seeds, wall time |
 | `<test>_predictions.npz` | per test loader: `index`, `kind` (0 satellite, 1 shapes, 2 patches), predicted and target masks of every scene, and the `epoch` of the weights |
 | `curves.png` | per-epoch LR, loss, mIoU and accuracy, with the run's info |
 | `model.best.pth` | weights from the best epoch |

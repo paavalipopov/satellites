@@ -288,7 +288,8 @@ class CustomRunner(dl.Runner):
         # weights come from, then put the true epoch count back for epochs_run
         epoch_buffer, self.epoch_step = self.epoch_step, best["epoch"]
 
-        # run the tests
+        # run the tests, each with its no-skill scores
+        baseline = {}
         for self.loader_key, self.loader in self.test_loaders.items():
             self._run_event("on_loader_start")
             self._run_loader()
@@ -296,6 +297,9 @@ class CustomRunner(dl.Runner):
             best["metrics"][self.loader_key] = {
                 k: float(v) for k, v in sorted(self.loader_metrics.items())
             }
+            baseline[self.loader_key] = self.meters["pixels"].baseline(
+                partial(self.engine.reduce, reduction="sum")
+            )
 
         # save logs and restore things
         self.engine.wait_for_everyone()  # every rank has saved its test predictions
@@ -321,6 +325,7 @@ class CustomRunner(dl.Runner):
                 "split_sizes": self._split_sizes,
                 "metrics": best["metrics"],
                 "bests": checkpoint.best,  # every selection; tests' scores only with test_every_epoch
+                "baseline": baseline,  # no-skill scores per test set
                 "seeds": self._seeds(),
                 "world_size": self.engine.num_processes,
                 "batch_size_per_rank": self.cfg.experiment.batch_size,
@@ -507,6 +512,8 @@ def main(cfg: DictConfig):
                 **{f"{loader}_{k}@{m}": v for m, b in best.get("bests", {}).items()
                    for loader, ms in b["metrics"].items() if loader.startswith("test")
                    for k, v in ms.items()},
+                **{f"baseline_{loader}_{k}": v
+                   for loader, ms in best.get("baseline", {}).items() for k, v in ms.items()},
                 **best["seeds"],
                 "world_size": best["world_size"],
                 "batch_size_per_rank": best["batch_size_per_rank"],
@@ -523,7 +530,8 @@ def main(cfg: DictConfig):
         writer.writeheader()
         writer.writerows(rows)
 
-    summary = {"n_runs": len(rows), "runs": [row["run"] for row in rows]}
+    summary = {"n_runs": len(rows), "runs": [row["run"] for row in rows],
+               "baseline": {k: v for k, v in rows[-1].items() if k.startswith("baseline_")}}
     for key in [c for c in rows[0] if c.startswith(("valid_", "test_"))]:
         values = [row[key] for row in rows if row.get(key) is not None]
         if not values:

@@ -160,13 +160,13 @@ class SegmentationMeter:
     Same reset/update/compute shape as catalyst's meters. To add a metric, add it to
     ``compute()`` and its name to ``names``: ``experiment.selection`` accepts it then.
     Class 0 is background. ``miou`` and ``macro_f1`` average over the classes present in
-    the target or the prediction; ``fg_*`` treat every material as one foreground class.
+    the target or the prediction; ``fg_*`` treat every material as one *ForeGround* class.
     The paper's Table 1 reports ``macro_precision`` (all classes, 0 for a class never
     predicted, as sklearn's zero_division=0) and ``fg_binary_accuracy``.
     """
 
     names = ("accuracy", "miou", "macro_f1", "macro_precision", "fg_accuracy", "fg_f1",
-             "fg_binary_accuracy")
+             "fg_iou", "fg_binary_accuracy")
 
     def __init__(self, n_classes, device):
         self.n_classes, self.device = n_classes, device
@@ -187,7 +187,23 @@ class SegmentationMeter:
 
     def compute(self, reduce=None):
         """The metrics over every pixel counted; ``reduce`` sums the counts across ranks."""
-        confusion = (reduce(self.confusion) if reduce else self.confusion).double().cpu()
+        return self.metrics(reduce(self.confusion) if reduce else self.confusion)
+
+    def baseline(self, reduce=None):
+        """No-skill scores on the same targets: per metric, the better of predicting all
+        background or all the most common material (the floor for the shape metrics)."""
+        counts = (reduce(self.confusion) if reduce else self.confusion).sum(1)  # per target class
+        guesses = []
+        for label in (0, int(counts[1:].argmax()) + 1):
+            confusion = torch.zeros_like(self.confusion)
+            confusion[:, label] = counts
+            guesses.append(self.metrics(confusion))
+        return {name: max(guess[name] for guess in guesses) for name in self.names}
+
+    @staticmethod
+    def metrics(confusion):
+        """Every metric in ``names`` from a ``[K, K]`` confusion matrix."""
+        confusion = confusion.double().cpu()
         tp = confusion.diag()
         fp, fn = confusion.sum(0) - tp, confusion.sum(1) - tp
         seen = (tp + fp + fn) > 0
@@ -203,6 +219,7 @@ class SegmentationMeter:
             "macro_precision": float((tp / (tp + fp).clamp_min(1)).mean()),
             "fg_accuracy": float(tp[1:].sum() / fg_pixels),
             "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
+            "fg_iou": float(fg_tp / (fg_tp + fg_fp + fg_fn).clamp_min(1)),
             "fg_binary_accuracy": float((fg_tp + confusion[0, 0]) / total),
         }
 
