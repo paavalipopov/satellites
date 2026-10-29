@@ -373,7 +373,7 @@ class CustomRunner(dl.Runner):
             self.meters["pixels"].update(pred, target)
             if self.test_preds is not None:
                 self.test_preds.append(
-                    (index.cpu(), kind.cpu(), pred.byte().cpu(), target.byte().cpu())
+                    (index.cpu(), kind.cpu(), pred.cpu(), target.cpu())
                 )
 
         # batch_metrics feeds the tqdm bar; the loader values are saved in the meters

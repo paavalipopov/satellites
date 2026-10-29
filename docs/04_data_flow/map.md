@@ -12,11 +12,11 @@ SeededBatchSampler (main process)
       ▼
 HSISplit.__getitem__ (worker)
    for each index: seed = scene_seed(keys, [epoch if train], index) ─► generate_sample
-   returns {index: {input [36,15,15], label [15,15], index}}
+   returns {index: {input [36,15,15], label [15,15], index, kind}}
       ▼
-collate_volumes (worker) ─► (inputs [B,36,15,15], masks [B,15,15], indices [B])
+collate_volumes (worker) ─► (inputs [B,36,15,15], masks [B,15,15], indices [B], kinds [B])
       ▼
 handle_batch (GPU)
    inputs  ─► model ─► logits [B,47,15,15]
    masks   ─► loss, SegmentationMeter
-   indices ─► test_preds (test loader only) ─► test_predictions.npz
+   indices, kinds ─► test_preds (test loader only) ─► test_predictions.npz

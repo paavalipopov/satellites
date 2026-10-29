@@ -326,7 +326,7 @@ class Sample:
     seed: int
     meta: dict[str, Any]
 
-    mask: np.ndarray                        # [H, W] uint8   <- the LABEL
+    mask: np.ndarray                        # [H, W] int64   <- the LABEL
     blend_weight: float                     # w in [0, 1]
     material_ids: list[int]
     spectra_clean: dict[int, np.ndarray]    # stage 2a, per material
@@ -371,7 +371,7 @@ class Sample:
             f"Sample(seed={self.seed}, kind={self.meta.get('kind')})\n"
             f"  grid            {self.cfg.n_bands} bands, {L[0]:.1f}-{L[-1]:.1f} nm "
             f"(step {L[1]-L[0]:.4f} nm)\n"
-            f"  mask            {self.mask.shape} uint8, ids {self.material_ids}\n"
+            f"  mask            {self.mask.shape} int64, ids {self.material_ids}\n"
             f"  cube            {self.cube.shape} {self.cube.dtype}  <- model input\n"
             f"  foreground      {self.foreground_fraction:.1%}   object span "
             f"{self.object_span_px} px\n"
@@ -421,7 +421,7 @@ def generate_sample(cfg: SimConfig, seed: int, library: SpectralLibrary,
     blurred = blur_cube(cube_noisy, cfg)
     cube = sensor_noise(blurred, cfg, rng)
 
-    return Sample(cfg=cfg, seed=seed, meta=meta, mask=mask, blend_weight=w_scene,
+    return Sample(cfg=cfg, seed=seed, meta=meta, mask=mask.astype(np.int64), blend_weight=w_scene,
                   material_ids=ids, spectra_clean=clean, spectra_noisy=noisy,
                   cube_clean=cube_clean, cube_noisy_spectra=cube_noisy,
                   cube_blurred=blurred, cube=cube)

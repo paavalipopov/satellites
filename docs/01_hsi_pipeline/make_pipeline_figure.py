@@ -254,7 +254,7 @@ def main():
     ], dy=20)
     py = panel(ax, S1, [
         ("mask M = label", dict(weight="bold", size=8.2)),
-        (f"{sz} × {sz}, uint8", dict(size=7.6, color=INK2)),
+        (f"{sz} × {sz}", dict(size=7.6, color=INK2)),
         ("0 = background", dict(size=7.6, color=INK2)),
         ("1–46 = material id", dict(size=7.6, color=INK2)),
     ])

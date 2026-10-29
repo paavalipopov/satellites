@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -c 48
-#SBATCH --mem=256g
+#SBATCH -c 24
+#SBATCH --mem=128g
 #SBATCH -p qTRDGPUH
 #SBATCH -t 24:00:00
 #SBATCH --exclude=arctrddgxa001
-#SBATCH --gres=gpu:A100:2
+#SBATCH --gres=gpu:A100:1
 #SBATCH -J estimate_10band
-# 10 runs; qTRDGPUH allows 8 GPUs per user, so 4 jobs run at a time
+# 10 runs; qTRDGPUH allows 8 GPUs per user, so 8 jobs run at a time
 #SBATCH --array=0-9
 # -D . runs in the submit folder: submit from the trainer root, `sbatch slurm/train_estimate.sh`
 #SBATCH -D .
@@ -32,7 +32,7 @@ echo "Using python from: $(which python)"
 # Models for assets/new_input/estimate.fits: its 10 bands (message.txt), in ascending
 # order. The FITS cube is stored red to blue, so flip its band axis before inference.
 # Bigger batches, more fresh scenes and more train workers than train.sh, to keep the
-# GPUs busier: 2 x 128 scenes per step, 20000 per epoch.
+# GPU busier: 128 scenes per step, 20000 per epoch.
 python train.py \
     experiment.name=estimate_10band \
     model.name=spectral_spatial \

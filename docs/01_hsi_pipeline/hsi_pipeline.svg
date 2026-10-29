@@ -10202,7 +10202,7 @@ L 524.88 571.86
     <text style="font-weight: 700; font-size: 8.2px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #1c1c1e" x="410.4" y="180.462688" transform="rotate(-0 410.4 180.462688)">mask M = label</text>
    </g>
    <g id="text_32">
-    <text style="font-size: 7.6px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4a4a4f" x="410.4" y="189.477125" transform="rotate(-0 410.4 189.477125)">15 × 15, uint8</text>
+    <text style="font-size: 7.6px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4a4a4f" x="410.4" y="189.477125" transform="rotate(-0 410.4 189.477125)">15 × 15</text>
    </g>
    <g id="text_33">
     <text style="font-size: 7.6px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4a4a4f" x="410.4" y="198.657125" transform="rotate(-0 410.4 198.657125)">0 = background</text>
