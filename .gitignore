@@ -124,3 +124,10 @@ ENV/
 
 Claude outputs/
 assets/
+
+# trainer
+/logs/
+slurm/logs/*
+!slurm/logs/.gitkeep
+wandb/
+outputs/

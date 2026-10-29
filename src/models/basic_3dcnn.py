@@ -8,10 +8,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 # Best-validation checkpoint (val mIoU 0.23), copied from
 # yao/resluts_n_model/3dcnn/Pristine_basic_3dcnn_seed33/
-WEIGHTS_DIR = Path(__file__).resolve().parents[2] / "assets/weights/basic_3dcnn"
+WEIGHTS_DIR = Path(__file__).resolve().parents[3] / "assets/weights/basic_3dcnn"
 WEIGHTS = {"seed33": WEIGHTS_DIR / "best_ckpt.pt"}
 
 
@@ -47,3 +48,17 @@ class Basic3DCNN(nn.Module):
         model = cls()
         model.load_state_dict(torch.load(WEIGHTS[name], map_location="cpu")["model"])
         return model
+
+
+def default_HPs(cfg):
+    runtime = cfg.get("runtime") or {}
+    return OmegaConf.create(
+        {
+            "in_channels": runtime.get("n_channels") or 36,
+            "num_classes": runtime.get("n_classes") or 47,
+            "hidden_channels": 64,
+        }
+    )
+
+
+MODEL = Basic3DCNN

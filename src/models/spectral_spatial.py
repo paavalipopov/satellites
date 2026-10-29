@@ -8,10 +8,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 # Paper checkpoints (TorchScript; keys = the paper's table rows),
 # copied from yao/resluts_n_model/yes_id/
-WEIGHTS_DIR = Path(__file__).resolve().parents[2] / "assets/weights/spectral_spatial"
+WEIGHTS_DIR = Path(__file__).resolve().parents[3] / "assets/weights/spectral_spatial"
 WEIGHTS = {
     "more_scenes": WEIGHTS_DIR / "model_nozoom_with_shapes.pt",     # satellites + shapes + patches
     "satellite_only": WEIGHTS_DIR / "model_nozoom_no_shapes.pt",
@@ -96,3 +97,16 @@ class SpectralSpatialHSIModel(nn.Module):
         model = cls()
         model.load_state_dict(torch.jit.load(str(WEIGHTS[name]), map_location="cpu").state_dict())
         return model
+
+
+def default_HPs(cfg):
+    runtime = cfg.get("runtime") or {}
+    return OmegaConf.create(
+        {
+            "in_channels": runtime.get("n_channels") or 36,
+            "num_classes": runtime.get("n_classes") or 47,
+        }
+    )
+
+
+MODEL = SpectralSpatialHSIModel
