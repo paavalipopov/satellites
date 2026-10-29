@@ -10,7 +10,7 @@
 #SBATCH -J estimate_10band
 # 10 runs; qTRDGPUH allows 8 GPUs per user, so 8 jobs run at a time
 #SBATCH --array=0-9
-# -D . runs in the submit folder: submit from the trainer root, `sbatch slurm/train_estimate.sh`
+# -D . runs in the submit folder: submit from the project root, `sbatch slurm/train_estimate.sh`
 #SBATCH -D .
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH -A psy53c17

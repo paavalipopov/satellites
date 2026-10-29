@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 
 # Best-validation checkpoint (val mIoU 0.23), copied from
 # yao/resluts_n_model/3dcnn/Pristine_basic_3dcnn_seed33/
-WEIGHTS_DIR = Path(__file__).resolve().parents[3] / "assets/weights/basic_3dcnn"
+WEIGHTS_DIR = Path(__file__).resolve().parents[2] / "assets/weights/basic_3dcnn"
 WEIGHTS = {"seed33": WEIGHTS_DIR / "best_ckpt.pt"}
 
 

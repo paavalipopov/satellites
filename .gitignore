@@ -131,3 +131,4 @@ slurm/logs/*
 !slurm/logs/.gitkeep
 wandb/
 outputs/
+tools/

@@ -1,7 +1,7 @@
 # Per-pixel material classification of synthetic satellite HSI
 
 Each scene is a [36, 15, 15] cube with a [15, 15] material mask (0 = background, 1-46 =
-materials), generated on the fly by `src/data_generation` (a copy of the project's `src/data_generation`).
+materials), generated on the fly by `src/data_generation`.
 Training scenes are fresh every epoch; valid and test are fixed sets, chosen by their seeds.
 Two test sets by default (`data.params.tests`): `test` (the scene mix) and `test_satellite`.
 Catalyst runner, Hydra config, single- or multi-GPU on SLURM.
@@ -30,9 +30,9 @@ python train.py experiment.name=my_run model.name=basic_3dcnn      # the 3D-CNN 
 sbatch slurm/train.sh                                             # from this folder; or train_baseline.sh
 ```
 
-The material sheets are read from `assets/materials` in the project root (one level above
-this folder); `+data.params.material_root=...` points elsewhere. On CPU, set
-`experiment.bf16=false` (bf16 is emulated and ~50x slower) and `loader.*.prefetches=0`.
+The material sheets are read from `assets/materials`; `+data.params.material_root=...` points
+elsewhere. On CPU, set `experiment.bf16=false` (bf16 is emulated and ~50x slower) and
+`loader.*.prefetches=0`.
 
 Any config key can be overridden on the command line, e.g.
 `experiment.epochs=100 experiment.batch_size=4 experiment.run_idx=1`.
@@ -46,7 +46,10 @@ conf/                     the config
 slurm/                    train.sh (spectral_spatial), train_baseline.sh (basic_3dcnn)
 src/models/               models: spectral_spatial (the paper's), basic_3dcnn (baseline)
 src/datasets/             datasets (hsi), and their own README
-src/data_generation/      the scene generator, copied from the project's src/
+src/data_generation/      the scene generator
+scripts/                  notebooks: generator walkthrough, training results, estimate.fits tests
+docs/                     notes and figures on the generator, the paper and the original code
+assets/                   material sheets, weights, new input (not in git)
 ```
 
 ## Config sections breakdown

@@ -8,7 +8,7 @@
 #SBATCH --exclude=arctrddgxa001
 #SBATCH --gres=gpu:A100:1
 #SBATCH -J satellite_baseline
-# -D . runs in the submit folder: submit from the trainer root, `sbatch slurm/train_baseline.sh`
+# -D . runs in the submit folder: submit from the project root, `sbatch slurm/train_baseline.sh`
 #SBATCH -D .
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH -A psy53c17

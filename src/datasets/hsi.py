@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 
 from src.data_generation import N_CLASSES, SimConfig, SpectralLibrary, generate_sample
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]  # holds assets/materials
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # holds assets/materials
 SCENE_KINDS = ("satellite", "shapes", "patches")  # a scene's "kind" is its index here
 
 
