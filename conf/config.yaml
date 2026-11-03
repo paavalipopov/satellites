@@ -1,0 +1,81 @@
+# Every key here is read by train.py. If you add one, wire it up or drop it.
+
+defaults:
+  - override hydra/job_logging: stdout  # no train.log; python logging goes to stdout
+
+hydra:
+  output_subdir: null    # no .hydra/ logs
+  run: {dir: .}          # no outputs/<date>/<time>/
+
+data:
+  name: hsi              # a module in src/datasets/; its default_HPs() holds the default params
+  params:                # override any default_HPs() key, e.g. +data.params.sim.sensor_noise_std=0.05
+    n_train: 10000       # fresh training scenes per epoch
+    n_valid: 1000        # valid and test: the same scenes every epoch and rerun
+    n_test: 1000
+    seed_train: 0        # training scenes also depend on the run and epoch
+    seed_valid: 1
+    seed_test: 2
+    tests:               # test loaders: name (starting with "test") -> scene type
+      test: random
+      test_satellite: satellite
+
+experiment:
+  name: test             # name for logs; logs land in <paths.logdir>/<name>/run_N
+  epochs: 100            # total number of training epochs
+  batch_size: 64         # number of samples per step, PER RANK
+  run_idx: 0             # run(s) THIS job trains, e.g. [0,1,2]; each has its own training scenes
+                         # and model init, all share the valid and test sets
+
+  sampler_seed: 42       # train order within an epoch (seed + epoch), and catalyst's global reseed
+
+  selection: [miou, loss]  # valid metrics that each pick a best epoch: loss or any of
+                           # SegmentationMeter.names (src/utils.py); the first one's model is
+                           # tested, the rest only save weights
+  test_every_epoch: True  # also test after every epoch: gives test*_ in _epoch_.csv and all test scores per selection
+  paths:
+    logdir: ./logs       # path to the directory where logs will be stored
+    init_weights: null   # checkpoint to initialise the model from (not a run resume)
+
+  resume: False          # skip finished runs, continue an interrupted one from its last epoch
+  save_state: True       # per-epoch state.last.pth, for mid-run resume
+  cudnn_benchmark: True  # autotune conv kernels; cubes are fixed-size
+  bf16: True             # bf16 autocast; weights and optimizer stay fp32
+  channels_last: True    # channels_last memory layout for the 2D convs; fails on basic_3dcnn
+  compile: True          # torch.compile: slower start, faster steps
+
+model:
+  name: spectral_spatial # a module in src/models/; its default_HPs() holds the defaults
+  init_seed: 42          # run i initialises from init_seed + i, same on every rank (null = random)
+  params: {}             # override any default_HPs() key, e.g. +model.params.hidden_channels=32 (basic_3dcnn)
+
+optimizer:
+  base_lr: 0.001
+  scale_lr: True         # max_lr = base_lr * sqrt(world_size), Adam's scaling rule
+
+loader:
+  train:
+    num_workers: 12
+    prefetch_factor: 4
+    persistent_workers: True
+    prefetches: 2        # BatchPrefetchLoaderWrapper depth; 0 disables it (needed on CPU)
+  eval:
+    num_workers: 12
+    prefetch_factor: 4
+    persistent_workers: True
+    prefetches: 2
+
+wandb:                   # needs `pip install wandb`; one wandb run per run
+  project: null          # wandb project; null keeps wandb off entirely
+  entity: null           # team or user; null = your wandb default
+  name: null             # run name; null = experiment.name, matching the log folder
+
+runtime:                 # filled in by train.py at startup; not for hand editing
+  run_idx: null          # the run being trained
+  world_size: null
+  n_channels: null       # read off the dataset; the model's in_channels defaults to it
+  n_classes: null        # distinct labels in the dataset; the model's n_classes defaults to it
+  max_lr: null           # base_lr after scale_lr
+  resume_runner: null    # checkpoint an interrupted run is continuing from
+
+stream_log: True         # tee each run's stdout into run_<i>/more/run.log

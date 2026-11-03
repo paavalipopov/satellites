@@ -1,0 +1,327 @@
+import csv
+import json
+import os
+import random
+import shutil
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+from contextlib import contextmanager
+
+import numpy as np
+import torch
+from catalyst import dl
+
+_TEE = {}  # the real stdout and the running tee, kept for the life of the run
+
+
+def setup_distributed_port(low=2000, high=2200):
+    """Set MASTER_PORT for Catalyst's DDP to a free port.
+    """
+    if "MASTER_PORT" in os.environ:
+        print(f"[Init] MASTER_PORT used by catalyst DDP already set to {os.environ['MASTER_PORT']}")
+        return
+
+    draw = random.Random()
+    for _ in range(50):
+        port = draw.randint(low, high)
+        with socket.socket() as probe:
+            if probe.connect_ex(("127.0.0.1", port)) != 0:  # nothing listening
+                break
+    else:
+        raise RuntimeError(f"no free port found in [{low}, {high}] for MASTER_PORT")
+
+    os.environ["MASTER_PORT"] = str(port)
+    print(f"[Init] MASTER_PORT used by catalyst DDP set to {port}")
+
+
+def world_size_from_env():
+    """Get # of GPUs available.
+
+    torch.cuda.device_count() can be faulty on some nodes.
+    """
+    return int(os.environ.get("SLURM_GPUS_ON_NODE", torch.cuda.device_count()))
+
+
+def tee_stdout(path=None):
+    """Duplicate stdout into ``path`` at the fd level, so spawned DDP ranks land in it too.
+
+    Each call ends the previous copy first, and ``path=None`` only ends it. tqdm writes to
+    stderr and is deliberately left out, which keeps the file readable.
+    """
+    sys.stdout.flush()
+    if "tee" in _TEE:  # back to the real stdout; the old tee drains and exits
+        os.dup2(_TEE["stdout"], sys.stdout.fileno())
+        _TEE.pop("tee").stdin.close()
+    if path is None:
+        return
+    try:
+        if "stdout" not in _TEE:  # the real stdout, to come back to
+            _TEE["stdout"] = os.dup(sys.stdout.fileno())
+        _TEE["tee"] = subprocess.Popen(["tee", "-a", path], stdin=subprocess.PIPE)
+        os.dup2(_TEE["tee"].stdin.fileno(), sys.stdout.fileno())
+        sys.stdout.reconfigure(line_buffering=True)
+    except (OSError, ValueError) as error:
+        print(f"[Log] could not tee stdout into {path}: {error}")
+
+
+def clear_rundir(rundir):
+    """Move an earlier run's artefacts into ``backup_<timestamp>/``.
+    """
+    if not os.path.isdir(rundir):
+        return
+    backup = os.path.join(rundir, time.strftime("backup_%Y%m%d_%H%M%S"))
+    artefacts = (".csv", ".json", ".jsonl", ".log", ".txt", ".yaml", ".pth", ".npz")
+    moved = 0
+    for root, dirs, names in os.walk(rundir):
+        dirs[:] = [d for d in dirs if not d.startswith("backup_")]  # keep older backups
+        for name in sorted(names):
+            if not name.endswith(artefacts):
+                continue
+            destination = os.path.join(backup, os.path.relpath(root, rundir), name)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.move(os.path.join(root, name), destination)
+            moved += 1
+    if moved:
+        print(f"[Log] moved {moved} file(s) from an earlier run into {backup}")
+
+
+@contextmanager
+def atomic_open(path):
+    """Write to a temporary file, then move it over ``path``, so jobs writing the same
+    file at once never leave it half-written."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", newline="") as handle:
+        yield handle
+    os.replace(tmp, path)
+
+
+class ModelCheckpoint(dl.ICheckpointCallback):
+    """Best weights per selection metric, plus the full training state for resuming.
+
+    ``model.best.pth`` holds the first metric's best epoch, ``model.best_<metric>.pth``
+    the others'; ``state.last.pth`` (with ``save_state``) the weights, optimizer, scheduler,
+    epoch and best epochs after the latest epoch. The main process replaces each file
+    atomically, so an interruption at any point leaves the previous complete set.
+    """
+
+    def __init__(self, logdir, selection, save_state=True, resume_from=None):
+        super().__init__()
+        self.logdir, self.selection = logdir, list(selection)
+        self.save_state, self.resume_from = save_state, resume_from
+        self.best = {}  # metric -> {"epoch", "score", "metrics"} of its best epoch so far
+
+    def path(self, metric):
+        name = "model.best" if metric == self.selection[0] else f"model.best_{metric}"
+        return os.path.join(self.logdir, f"{name}.pth")
+
+    def _save(self, runner, obj, path):
+        if runner.engine.is_main_process:  # every rank holds the same weights
+            torch.save(obj, path + ".tmp")
+            os.replace(path + ".tmp", path)
+
+    def on_experiment_start(self, runner):
+        if self.resume_from:
+            state = torch.load(self.resume_from, map_location="cpu")
+            runner.engine.unwrap_model(runner.model).load_state_dict(state["model"])  # DDP-safe
+            runner.optimizer.load_state_dict(state["optimizer"])
+            runner.scheduler.load_state_dict(state["scheduler"])
+            runner.epoch_step, self.best = state["epoch"], state["best"]
+            runner.loaders["train"].set_epoch(runner.epoch_step)  # data order as if never stopped
+            print(f"[Resume] from epoch {runner.epoch_step}, best epochs",
+                  {k: v["epoch"] for k, v in self.best.items()})
+
+    def on_epoch_end(self, runner):
+        model = runner.engine.unwrap_model(runner.model)
+        metrics = {k: dict(v) for k, v in runner.epoch_metrics.items() if k != "_epoch_"}
+        for metric in self.selection:
+            score, best = metrics["valid"][metric], self.best.get(metric, {}).get("score")
+            if best is None or (score < best if metric == "loss" else score > best):
+                self.best[metric] = {
+                    "epoch": runner.epoch_step, "score": score, "metrics": metrics
+                }
+                self._save(runner, model.state_dict(), self.path(metric))
+        if self.save_state:
+            state = {
+                "model": model.state_dict(),
+                "optimizer": runner.optimizer.state_dict(),
+                "scheduler": runner.scheduler.state_dict(),
+                "epoch": runner.epoch_step,
+                "best": self.best,
+            }
+            self._save(runner, state, os.path.join(self.logdir, "state.last.pth"))
+
+
+class SegmentationMeter:
+    """Pixel confusion counts over one loader pass, and the metrics computed from them.
+
+    Same reset/update/compute shape as catalyst's meters. To add a metric, add it to
+    ``compute()`` and its name to ``names``: ``experiment.selection`` accepts it then.
+    Class 0 is background. ``miou`` and ``macro_f1`` average over the classes present in
+    the target or the prediction; ``fg_*`` treat every material as one *ForeGround* class.
+    The paper's Table 1 reports ``macro_precision`` (all classes, 0 for a class never
+    predicted, as sklearn's zero_division=0) and ``fg_binary_accuracy``.
+    """
+
+    names = ("accuracy", "miou", "macro_f1", "macro_precision", "fg_accuracy", "fg_f1",
+             "fg_iou", "fg_binary_accuracy")
+
+    def __init__(self, n_classes, device):
+        self.n_classes, self.device = n_classes, device
+        self.reset()
+
+    def reset(self):
+        # rows target, columns prediction
+        self.confusion = torch.zeros(
+            self.n_classes, self.n_classes, dtype=torch.long, device=self.device
+        )
+
+    def update(self, pred, target):
+        """Count a batch of ``[B,H,W]`` predicted and target masks."""
+        k = self.n_classes
+        # each pixel adds 1 to its (target t, prediction p) cell: code t*k + p is that cell's
+        # position once the k*k counts are cut into rows of k; correct pixels land on the diagonal
+        self.confusion += torch.bincount((target * k + pred).flatten(), minlength=k * k).view(k, k)
+
+    def compute(self, reduce=None):
+        """The metrics over every pixel counted; ``reduce`` sums the counts across ranks."""
+        return self.metrics(reduce(self.confusion) if reduce else self.confusion)
+
+    def baseline(self, reduce=None):
+        """No-skill scores on the same targets: per metric, the better of predicting all
+        background or all the most common material (the floor for the shape metrics)."""
+        counts = (reduce(self.confusion) if reduce else self.confusion).sum(1)  # per target class
+        guesses = []
+        for label in (0, int(counts[1:].argmax()) + 1):
+            confusion = torch.zeros_like(self.confusion)
+            confusion[:, label] = counts
+            guesses.append(self.metrics(confusion))
+        return {name: max(guess[name] for guess in guesses) for name in self.names}
+
+    @staticmethod
+    def metrics(confusion):
+        """Every metric in ``names`` from a ``[K, K]`` confusion matrix."""
+        confusion = confusion.double().cpu()
+        tp = confusion.diag()
+        fp, fn = confusion.sum(0) - tp, confusion.sum(1) - tp
+        seen = (tp + fp + fn) > 0
+
+        # foreground: is it a material at all, and which one
+        fg_tp, fg_fp, fg_fn = confusion[1:, 1:].sum(), confusion[0, 1:].sum(), confusion[1:, 0].sum()
+        fg_pixels = confusion[1:].sum().clamp_min(1)
+        total = confusion.sum().clamp_min(1)
+        return {
+            "accuracy": float(tp.sum() / total),
+            "miou": float((tp / (tp + fp + fn).clamp_min(1))[seen].mean()),
+            "macro_f1": float((2 * tp / (2 * tp + fp + fn).clamp_min(1))[seen].mean()),
+            "macro_precision": float((tp / (tp + fp).clamp_min(1)).mean()),
+            "fg_accuracy": float(tp[1:].sum() / fg_pixels),
+            "fg_f1": float(2 * fg_tp / (2 * fg_tp + fg_fp + fg_fn).clamp_min(1)),
+            "fg_iou": float(fg_tp / (fg_tp + fg_fp + fg_fn).clamp_min(1)),
+            "fg_binary_accuracy": float((fg_tp + confusion[0, 0]) / total),
+        }
+
+
+def run_info(summaries, cfg):
+    """Plain-text description of one or more runs, for the info panel of curves.png."""
+    params, first = cfg["data"]["params"], summaries[0]
+    shown = ("n_train", "n_valid", "n_test", "scene")
+    lines = [
+        f"experiment  {cfg['experiment']['name']}",
+        f"runs        {', '.join(str(s['run_idx']) for s in summaries)}",
+        f"data        {cfg['data']['name']}: "
+        + ", ".join(f"{key}={params[key]}" for key in shown if key in params),
+        "split       " + ", ".join(f"{k} {v}" for k, v in first["split_sizes"].items())
+        + (f" (run {first['run_idx']})" if len(summaries) > 1 else ""),
+        f"model       {cfg['model']['name']}, {cfg['runtime']['n_channels']} channel(s)",
+        f"training    {first['epochs_run']} epochs, batch {first['batch_size_per_rank']}"
+        f" x {first['world_size']} rank(s), max_lr {first['max_lr']:.4g}, "
+        f"{np.mean([s['minutes'] for s in summaries]):.0f} min/run",
+        f"best epoch  {', '.join(str(s['best_epoch']) for s in summaries)}, "
+        f"{first['selected_on']} (dots)",
+    ]
+
+    # metrics at each run's best epoch, mean±sd over runs
+    for name in ("train", "valid", *[k for k in first["metrics"] if k.startswith("test")]):
+        keys = sorted(first["metrics"].get(name, {}))
+        values = {k: [s["metrics"][name][k] for s in summaries] for k in keys}
+        if values:
+            lines.append(f"{name + ' @best':<11} " + "  ".join(
+                f"{k} {np.mean(v):.3f}" + (f"±{np.std(v):.3f}" if len(v) > 1 else "")
+                for k, v in values.items()
+            ))
+    lines.append("curves      train blue, valid orange, tests after; one line per run")
+    return "\n".join(textwrap.fill(line, 74, subsequent_indent=" " * 12) for line in lines)
+
+
+def plot_curves(rundirs, cfg, path):
+    """Save the training curves of one or more runs as ``path``, one line per run.
+
+    Reads each run's _epoch_.csv and run_summary.json, so it works on finished runs too.
+    Never raises: a plotting problem must not cost a finished run.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+        fig, ((lr_ax, metric_ax), (loss_ax, info_ax)) = plt.subplots(2, 2, figsize=(13, 8))
+        alpha = 1 if len(rundirs) == 1 else 0.5
+        summaries = []
+        for i, rundir in enumerate(rundirs):
+            # the run's summary, and the per-epoch log as {column: array}
+            with open(os.path.join(rundir, "run_summary.json")) as handle:
+                summaries.append(json.load(handle))
+            best, metrics = summaries[-1]["best_epoch"], summaries[-1]["metrics"]
+            tests = [name for name in metrics if name.startswith("test")]
+            with open(os.path.join(rundir, "_epoch_.csv")) as handle:
+                rows = list(csv.DictReader(handle))
+            log = {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
+            hide = "_" if i else ""  # "_" labels stay out of the legend
+            colors = {name: f"C{j}" for j, name in enumerate(("train", "valid", *tests))}
+
+            # lr; train vs valid: loss, miou (solid), accuracy (dashed)
+            epoch = log["step"]
+            lr_ax.plot(epoch, log["lr"], color="k", alpha=alpha)
+            for name, color in colors.items():
+                if f"{name}_loss" not in log:  # tests are logged only with test_every_epoch
+                    continue
+                loss_ax.plot(epoch, log[f"{name}_loss"], color=color, alpha=alpha, label=hide + name)
+                metric_ax.plot(epoch, log[f"{name}_miou"], color=color, alpha=alpha,
+                               label=f"{hide}{name} miou")
+                metric_ax.plot(epoch, log[f"{name}_accuracy"], color=color, alpha=alpha, ls="--",
+                               label=f"{hide}{name} accuracy")
+
+            # best epoch: dots on lr and valid loss, each test's scores
+            for ax, key in ((lr_ax, "lr"), (loss_ax, "valid_loss")):
+                ax.plot(best, np.interp(best, epoch, log[key]), "o", mfc="w", mec="k", ms=5)
+            for name in tests:
+                metric_ax.plot(best, metrics[name].get("miou", np.nan), "*", color=colors[name],
+                               mec="k", ms=10, label=f"{hide}{name} miou")
+                metric_ax.plot(best, metrics[name].get("accuracy", np.nan), "x",
+                               color=colors[name], ms=8, label=f"{hide}{name} accuracy")
+
+        lr_ax.set(title="learning rate (end of epoch)", xlabel="epoch")
+        metric_ax.set(title="mIoU and accuracy", xlabel="epoch")
+        metric_ax.legend(fontsize=8, ncol=3)
+
+        # log-scale loss, ticks 1-2-5 as plain numbers
+        loss_ax.set(title="loss", xlabel="epoch", yscale="log")
+        loss_ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 5)))
+        loss_ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+        loss_ax.yaxis.set_minor_formatter(NullFormatter())
+        loss_ax.legend()
+
+        info_ax.axis("off")
+        info_ax.text(0, 1, run_info(summaries, cfg), va="top", family="monospace", fontsize=9)
+
+        fig.suptitle(cfg["experiment"]["name"])
+        fig.tight_layout()
+        fig.savefig(f"{path}.{os.getpid()}.tmp", dpi=110, format="png")
+        os.replace(f"{path}.{os.getpid()}.tmp", path)  # atomic: jobs may plot at once
+        plt.close(fig)
+    except Exception as error:  # noqa: BLE001
+        print(f"[Plot] {path} skipped: {error}")
