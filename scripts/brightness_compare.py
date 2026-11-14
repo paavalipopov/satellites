@@ -10,6 +10,7 @@ it puts all experiments side by side, and writes one table of accuracies against
     python scripts/brightness_compare.py --baseline estimate_10band \\
         --experiments estimate_10band_aug_norm estimate_10band_full_max
     python scripts/brightness_compare.py --n-scenes 50 --max-runs 3      # a quicker look
+    python scripts/brightness_compare.py --reading radiometry            # estimate.fits read with the collaborators' recipe
 
 On the cluster: sbatch slurm/compare_brightness.sh   (or: bash slurm/compare_brightness.sh)
 
@@ -155,13 +156,15 @@ def summary_table(exps, syn, rob, fits):
     return pd.DataFrame(rows).set_index("experiment")
 
 
-def markdown(table):
+def markdown(table, reading="solar"):
     def fmt(v):
         return "" if pd.isna(v) else (f"{v:.0f}" if abs(v) >= 100 else f"{v:.3f}")
     delta = table - table.iloc[0]                       # the first row is the baseline
     lines = ["# Comparison with the original model", "",
              "Mean over each experiment's runs. (higher) / (lower) says which way is better. "
-             "The change column is new minus original.", ""]
+             "The change column is new minus original.",
+             f"estimate.fits was read as: `{reading}` (solar = notebook 06, the previous results; radiometry = the "
+             "collaborators' recipe, see scripts/fits_reading.py).", ""]
     for col in table.columns:
         lines += [f"## {col}", "", "| experiment | value | change from original |", "|---|---|---|"]
         for name in table.index:
@@ -182,6 +185,10 @@ def main():
     ap.add_argument("--n-scenes", type=int, default=200, help="synthetic scenes per kind and level")
     ap.add_argument("--seed", type=int, default=777)
     ap.add_argument("--skip-synthetic", action="store_true", help="only estimate.fits (the maps and their scores)")
+    ap.add_argument("--reading", default="solar", choices=("solar", "radiometry", "radiometry_sun"),
+                    help="how estimate.fits is divided before the model sees it (scripts/fits_reading.py). "
+                         "solar = notebook 06 = the previous results (default); radiometry = the collaborators' recipe")
+    ap.add_argument("--reading-mag", type=float, default=None, help="only sets the overall constant of the radiometry readings")
     ap.add_argument("--out", default=str(ROOT / "outputs/brightness_compare"))
     args = ap.parse_args()
 
@@ -203,12 +210,14 @@ def main():
               f"empty_prob={e.config.data.params.sim.get('empty_prob', 0.0)}")
 
     if args.skip_synthetic:
-        syn = rob = pd.DataFrame(columns=["experiment", "scenes", "stage", "log10_gain", "test", "level"])
+        cols = ["experiment", "scenes", "stage", "log10_gain", "test", "level",
+                "material_acc", "foreground_iou", "false_fg_share", "labelled_share"]
+        syn = rob = pd.DataFrame(columns=cols)                 # empty: the synthetic columns of the table stay blank
     else:
         syn, rob = ev.run_synthetic(exps, args, out)
 
-    print("estimate.fits against object.fits")
-    scene = ev.FitsScene(exps[0].data.cfg.wavelengths_nm)
+    print(f"estimate.fits against object.fits, read as: {args.reading}")
+    scene = ev.FitsScene(exps[0].data.cfg.wavelengths_nm, args.reading, args.reading_mag)
     fits, maps = ev.fits_results(exps, scene)
     fits.to_csv(out / "estimate_fits.csv", index=False)
 
@@ -219,7 +228,7 @@ def main():
 
     table = summary_table(exps, syn, rob, fits)
     table.round(4).to_csv(out / "comparison_summary.csv")
-    (out / "comparison_summary.md").write_text(markdown(table))
+    (out / "comparison_summary.md").write_text(markdown(table, args.reading))
     with pd.option_context("display.width", 250, "display.max_columns", 40, "display.max_colwidth", 60):
         for chunk in (table.iloc[:, :6], table.iloc[:, 6:10], table.iloc[:, 10:]):
             print(chunk.round(3).to_string(), "\n")

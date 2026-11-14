@@ -3,13 +3,15 @@
 #SBATCH -n 1
 #SBATCH -c 1
 #SBATCH --mem=2g
-#SBATCH -p qTRDGPUH
 #SBATCH -t 00:10:00
 #SBATCH -J submit_grid
+#SBATCH -A psy53c17
+#SBATCH -p qTRD
 # -D . runs in the submit folder: submit from the project root
 #SBATCH -D .
 #SBATCH --output=slurm/logs/%x_%j.out
-#SBATCH -A psy53c17
+# -A psy53c17 -p qTRD: the lab account and the CPU partition; this job only calls sbatch. (qTRDGPUH refuses a job without
+# a GPU, and the cluster's default partition refuses this group: "User's group not permitted to use this partition".)
 
 # Submit several variants of slurm/train_brightness.sh in one go (each becomes its own 10-run array job).
 # It only calls sbatch a few times, so it can be run either way, from the project root:

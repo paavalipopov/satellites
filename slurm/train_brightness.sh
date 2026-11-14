@@ -4,7 +4,7 @@
 #SBATCH -c 24
 #SBATCH --mem=128g
 #SBATCH -p qTRDGPUH
-#SBATCH -t 24:00:00
+#SBATCH -t 02:00:00
 #SBATCH --exclude=arctrddgxa001
 #SBATCH --gres=gpu:A100:1
 #SBATCH -J brightness
@@ -31,6 +31,9 @@
 # GAIN_RANGE   log10 of the overall brightness factor, "lo,hi": -1.5,0.5 means 0.03x to 3x (default)
 # GAIN_STAGE   before_noise (a dimmer object against the same sensor noise) | after_noise (a change of units)
 # COMPILE      true (default) | false: set false if a job dies in torch.compile (p99 uses kthvalue)
+# N_TRAIN      fresh scenes per epoch (default 20000). The pair_* variants use every scene twice (as generated and
+#              divided by its max), so an epoch has 2 x N_TRAIN items: slurm/run_pipeline.sh gives them 10000 so that an
+#              epoch costs the same as for the others
 # EXTRA        more Hydra overrides, e.g. EXTRA="+data.params.sim.noise_bank=/path/to/bank.npy"
 
 set -e
@@ -43,6 +46,7 @@ GAIN_RANGE=${GAIN_RANGE:--1.5,0.5}
 GAIN_STAGE=${GAIN_STAGE:-before_noise}
 COMPILE=${COMPILE:-true}
 EXTRA=${EXTRA:-}
+N_TRAIN=${N_TRAIN:-20000}
 
 export TMPDIR=/tmp
 export HYDRA_FULL_ERROR=1
@@ -69,7 +73,7 @@ python train.py \
     experiment.epochs=200 \
     experiment.batch_size=128 \
     optimizer.base_lr=0.001 \
-    data.params.n_train=20000 \
+    data.params.n_train=$N_TRAIN \
     data.params.n_valid=1000 \
     data.params.n_test=1000 \
     +data.params.sim.n_bands=10 \

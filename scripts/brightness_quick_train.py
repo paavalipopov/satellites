@@ -23,8 +23,9 @@ from omegaconf import OmegaConf
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
-from brightness_presets import PRESETS, experiment_name, model_options, sim_options  # noqa: E402
+from brightness_presets import PRESETS, data_options, experiment_name, loss_options, model_options, sim_options  # noqa: E402
 from src.data_generation import SpectralLibraryWarning  # noqa: E402
+from src.losses import build_criterion  # noqa: E402
 from src.registry import build_dataset, build_model  # noqa: E402
 
 warnings.simplefilter("ignore", SpectralLibraryWarning)
@@ -62,7 +63,8 @@ def main():
     name = experiment_name(args.variant)
 
     cfg = OmegaConf.create({
-        "data": {"name": "hsi", "params": {"n_train": args.pool, "n_valid": args.valid, "n_test": 100, "sim": sim}},
+        "data": {"name": "hsi", "params": {"n_train": args.pool, "n_valid": args.valid, "n_test": 100, "sim": sim,
+                                       **data_options(args.variant)}},
         "model": {"name": "spectral_spatial", "init_seed": 42, "params": model_params},
         "runtime": {"n_channels": 10, "n_classes": 47, "run_idx": args.run},
     })
@@ -71,11 +73,13 @@ def main():
     torch.manual_seed(cfg.model.init_seed + args.run)
 
     t0 = time.time()
-    xt, yt = scenes(dataset.split("train", run=args.run), args.pool)
+    train_split = dataset.split("train", run=args.run)
+    xt, yt = scenes(train_split, len(train_split))       # 2 x pool items for the max=1 pairs
     xv, yv = scenes(dataset.split("valid"), args.valid)
     print(f"{name}: {len(xt)} train / {len(xv)} valid scenes in {time.time() - t0:.0f} s; "
           f"input range [{xt.min():.4f}, {xt.max():.2f}], model input_norm={model.input_norm}", flush=True)
 
+    criterion = build_criterion(loss_options(args.variant))
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     g = torch.Generator().manual_seed(1234 + args.run)
     order, pos = torch.randperm(len(xt), generator=g), 0
@@ -85,7 +89,7 @@ def main():
             order, pos = torch.randperm(len(xt), generator=g), 0
         idx = order[pos:pos + args.batch]; pos += args.batch
         model.train()
-        loss = F.cross_entropy(model(xt[idx]), yt[idx])
+        loss = criterion(model(xt[idx]), yt[idx])
         opt.zero_grad(); loss.backward(); opt.step()
         if step % 50 == 0 or step == args.steps:
             model.eval()

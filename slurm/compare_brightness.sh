@@ -3,19 +3,19 @@
 #SBATCH -n 1
 #SBATCH -c 8
 #SBATCH --mem=32g
-#SBATCH -p qTRDGPUH
 #SBATCH -t 04:00:00
-#SBATCH --exclude=arctrddgxa001
-#SBATCH --gres=gpu:A100:1
 #SBATCH -J brightness_compare
+#SBATCH -A psy53c17
+#SBATCH -p qTRD
 # -D . runs in the submit folder: submit from the project root
 #SBATCH -D .
 #SBATCH --output=slurm/logs/%x_%j.out
-#SBATCH -A psy53c17
+# -A psy53c17 -p qTRD: the lab account and the CPU partition. No GPU line on purpose: the models are tiny.
+# (qTRDGPUH, the GPU partition, refuses a job without a GPU; the cluster's default partition refuses this group.)
 
 # Compares the new experiments with the previous (original) model: accuracy tables AND the notebook-06
 # maps (true materials, models' labels, share of models: an object / its material), side by side.
-# It needs no GPU (the models are tiny), so the GPU lines above can go if your queue wants CPU jobs.
+# It needs no GPU, so it runs as a plain CPU job.
 #
 #   sbatch slurm/compare_brightness.sh        # or:  bash slurm/compare_brightness.sh
 #
@@ -27,6 +27,8 @@
 #   OUT          where the results go                          (default outputs/brightness_compare)
 #   N_SCENES     synthetic scenes per test level               (default 200)
 #   MAX_RUNS     use only the first N runs of each experiment  (default: all)
+#   READING      how estimate.fits is read: solar (default, the previous results) | radiometry (the collaborators'
+#                recipe, scripts/fits_reading.py) | radiometry_sun;  READING_MAG sets only the overall constant
 # e.g.  EXPERIMENTS="estimate_10band_aug_norm estimate_10band_full_max" sbatch slurm/compare_brightness.sh
 #
 # Results: OUT/comparison_summary.md and .csv, OUT/maps_side_by_side.png, OUT/maps_<experiment>.png, ...
@@ -46,6 +48,8 @@ echo "Using python from: $(which python)"
 
 ARGS=(--baseline "${BASELINE:-estimate_10band}" --logdir "${LOGDIR:-logs}" --out "${OUT:-outputs/brightness_compare}" --n-scenes "${N_SCENES:-200}")
 [ -n "$MAX_RUNS" ] && ARGS+=(--max-runs "$MAX_RUNS")
+[ -n "$READING" ] && ARGS+=(--reading "$READING")
+[ -n "$READING_MAG" ] && ARGS+=(--reading-mag "$READING_MAG")
 [ -n "$EXPERIMENTS" ] && ARGS+=(--experiments $EXPERIMENTS)
 
 python scripts/brightness_compare.py "${ARGS[@]}"

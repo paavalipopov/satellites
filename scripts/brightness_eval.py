@@ -32,6 +32,7 @@ from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 from src.data_generation import N_CLASSES, SpectralLibraryWarning, generate_sample  # noqa: E402
 from src.datasets.hsi import HSIDataset, scene_seed  # noqa: E402
 from src.registry import build_model  # noqa: E402
@@ -252,18 +253,21 @@ def combine(preds):
 
 
 class FitsScene:
-    """assets/new_input/estimate.fits and object.fits, read like notebook 06 (V / (E.dlam), blue to red)."""
+    """assets/new_input/estimate.fits and object.fits, blue to red. `reading` says how the electrons are turned into
+    the numbers the model sees (scripts/fits_reading.py): "solar" = notebook 06's V / (E.dlam), the default;
+    "radiometry" = the collaborators' recipe (divide by what the simulator applied, no sun); "radiometry_sun" = the
+    same with a sun divided out as well. `mag` only sets the overall constant of the radiometry readings."""
 
     SIZE = 41          # px, the patch around both objects (notebook 06)
     COMPANION = 21     # px, the window around the companion alone
 
-    def __init__(self, lam):
-        import pvlib
+    def __init__(self, lam, reading="solar", mag=None):
         from astropy.io import fits
         from scipy import ndimage
+        import fits_reading
 
-        solar = pvlib.spectrum.get_reference_spectra(standard="ASTM G173-03")["extraterrestrial"]
-        divisor = np.interp(lam, solar.index, solar.values) * lam ** 2 / 6400          # E * d_lambda
+        self.reading_name = reading
+        divisor = fits_reading.divisor(reading, lam, fits_reading.DEFAULT_MAG if mag is None else mag)
         cube = fits.getdata(ROOT / "assets/new_input/estimate.fits").astype(float)[::-1]    # blue -> red
         truth = fits.getdata(ROOT / "assets/new_input/object.fits").astype(float)[::-1]
         self.reading = cube / divisor[:, None, None]
@@ -357,7 +361,8 @@ def fits_results(experiments, scene=None):
                     "satellite_px_found": int((found & ts).sum()), "satellite_px_true": int(ts.sum()),
                     "companion_px_found": int((found & tc).sum()), "companion_px_true": int(tc.sum()),
                     "share_object_on_found": float(objectness[found].mean()) if found.any() else np.nan,
-                    "share_material_on_found": float(agreement[found].mean()) if found.any() else np.nan})
+                    "share_material_on_found": float(agreement[found].mean()) if found.any() else np.nan,
+                    "reading": scene.reading_name})
                 maps[(e.name, label_name)] = {"labels": lab, "objectness": objectness, "agreement": agreement,
                                               "true_fg": tf, "regions": tr}
     return pd.DataFrame(rows), maps
@@ -394,6 +399,10 @@ def main():
     ap.add_argument("--n-scenes", type=int, default=200, help="synthetic scenes per kind and level")
     ap.add_argument("--seed", type=int, default=777, help="first key of the scene seeds, apart from every training and test seed")
     ap.add_argument("--no-fits", action="store_true", help="skip the estimate.fits part")
+    ap.add_argument("--reading", default="solar", choices=("solar", "radiometry", "radiometry_sun"),
+                    help="how estimate.fits is divided before the model sees it (scripts/fits_reading.py); "
+                         "solar = notebook 06, the previous results")
+    ap.add_argument("--reading-mag", type=float, default=None, help="only sets the overall constant of the radiometry readings")
     ap.add_argument("--out", default=str(ROOT / "outputs/brightness_eval"))
     args = ap.parse_args()
 
@@ -410,7 +419,7 @@ def main():
 
     if not args.no_fits:
         print("estimate.fits against object.fits")
-        ft, _ = fits_results(exps)
+        ft, _ = fits_results(exps, FitsScene(exps[0].data.cfg.wavelengths_nm, args.reading, args.reading_mag))
         ft.to_csv(out / "estimate_fits.csv", index=False)
         with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_rows", 400):
             print(ft.round(3).to_string(index=False))

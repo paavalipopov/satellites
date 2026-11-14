@@ -214,7 +214,10 @@ class CustomRunner(dl.Runner):
         return model
 
     def get_criterion(self):
-        return torch.nn.CrossEntropyLoss()
+        # plain cross-entropy unless a `loss` section is given (+loss.fg_weight=3.0, +loss.dice=0.5; src/losses.py)
+        from src.losses import build_criterion
+
+        return build_criterion(OmegaConf.select(self.cfg, "loss"))
 
     def get_optimizer(self, model):
         # Note: OneCycleLR overwrites the LR defined here
