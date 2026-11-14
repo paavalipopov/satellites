@@ -1,0 +1,132 @@
+data:
+    name: hsi
+    params:
+        n_train: 20000
+        n_valid: 1000
+        n_test: 1000
+        seed_train: 0
+        seed_valid: 1
+        seed_test: 2
+        scene: random
+        tests:
+            test: random
+            test_satellite: satellite
+        material_root: null
+        max_one_copies: false
+        pair_copies: null
+        sim:
+            lambda_min_nm: 350.0
+            lambda_max_nm: 1000.0
+            n_bands: 10
+            wavelengths:
+            - 400.0
+            - 426.667
+            - 457.143
+            - 492.308
+            - 533.333
+            - 581.818
+            - 640.0
+            - 711.111
+            - 800.0
+            - 914.286
+            image_size: 15
+            camera_height: 17.0
+            fov_deg: 60.0
+            blend_weight_per_material: false
+            material_noise_scale: 0.5
+            aperture_m: 3.6
+            psf_k: 0.25
+            pixel_pitch_m: 5.0e-06
+            focal_length_m: 120.0
+            sensor_noise_std: 0.02
+            gain_log10_range:
+            - -1.5
+            - 0.5
+            gain_stage: before_noise
+            response_log10_std: 0.0
+            response_knots: 4
+            empty_prob: 0.0
+            empty_noise_log10_range:
+            - -3.0
+            - 0.0
+            halo_log10_range: null
+            halo_sigma_px:
+            - 2.0
+            - 6.0
+            artifact_std_range: null
+            artifact_sigma_px:
+            - 0.7
+            - 2.5
+            artifact_band_corr: 0.6
+            artifact_skew: 0.5
+            noise_bank: null
+            noise_bank_log10_scale:
+            - 0.0
+            - 0.0
+            on_invalid: warn
+            clip_reflectance: true
+            require_irradiated: false
+            extrapolate_red: hold
+            on_unmeasured: warn
+            panel_thickness: 0.01
+            rasterizer: cv2
+            p_satellite: 0.3
+            p_shapes: 0.3
+            p_patches: 0.4
+            material_dir: assets/materials
+experiment:
+    name: estimate_10band_aug_fg3
+    epochs: 200
+    batch_size: 128
+    run_idx: 2
+    sampler_seed: 42
+    selection:
+    - miou
+    - loss
+    test_every_epoch: true
+    paths:
+        logdir: ./logs
+        init_weights: null
+    resume: false
+    save_state: true
+    cudnn_benchmark: true
+    bf16: true
+    channels_last: true
+    compile: true
+model:
+    name: spectral_spatial
+    init_seed: 42
+    params:
+        in_channels: 10
+        num_classes: 47
+        input_norm: none
+        norm_eps: 1.0e-08
+        norm_quantile: 0.99
+optimizer:
+    base_lr: 0.001
+    scale_lr: true
+loader:
+    train:
+        num_workers: 20
+        prefetch_factor: 4
+        persistent_workers: true
+        prefetches: 2
+    eval:
+        num_workers: 4
+        prefetch_factor: 4
+        persistent_workers: true
+        prefetches: 2
+wandb:
+    project: null
+    entity: null
+    name: null
+runtime:
+    run_idx: null
+    world_size: 1
+    n_channels: 10
+    n_classes: 47
+    max_lr: 0.001
+    resume_runner: null
+stream_log: true
+loss:
+    fg_weight: 3.0
